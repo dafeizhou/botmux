@@ -87,7 +87,12 @@ describe('usage-refresh timer wiring (source lock)', () => {
     // unauthorized card. Each gate is `{ clearUsageRefreshTimer(ds); break; }`.
     expect(src).toContain('if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }');
     expect(src).toContain('if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }');
-    expect(src).toContain('if (ds.suppressRecoveryCard) { clearUsageRefreshTimer(ds); break; }');
+    // Restart recovery only denies a NEW card; a surviving card still takes the
+    // same-turn status PATCH, whose syncUsageRefreshTimer keeps the timer off
+    // (usageRefreshShouldRun refuses while suppressRecoveryCard is set).
+    expect(src).toMatch(/if \(ds\.suppressRecoveryCard\s*&& \(ds\.streamCardPending \|\| !ds\.streamCardId \|\| ds\.streamCardId === CARD_POSTING_SENTINEL\)\) \{\s*clearUsageRefreshTimer\(ds\);\s*break;\s*\}/);
+    expect(functionBody(src, 'export function usageRefreshShouldRun(ds: DaemonSession): boolean {'))
+      .toContain('ds.suppressRecoveryCard) return false;');
   });
 
   it('screenshot_uploaded is clear-only — it never arms the timer', () => {

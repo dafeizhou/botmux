@@ -496,6 +496,11 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
+import {
+  ClaudeTranscriptTurnEnd,
+  STALE_PROGRAM_STATUS_CHECK_MS,
+  staleProgramStatusVerdict,
+} from './utils/stale-program-status.js';
 import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
 import {
   StuckDetector,
@@ -7462,6 +7467,8 @@ function bridgeIngest(): void {
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
+  claudeTranscriptTurnEnd.observe(result.events);
+  if (claudeTranscriptTurnEnd.endedForMs() !== undefined) scheduleStaleProgramStatusCheck();
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
@@ -7871,7 +7878,11 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
-    const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
+    // A turn folded into the running one (mid-turn system reminder) starts
+    // inside that turn and shares its reply, so it must not cut the host's
+    // send window short — the next boundary is the next turn of its own.
+    const nextOwnTurn = ready.slice(i + 1).find(next => !next.absorbedIntoTurnId);
+    const nextBoundaryMs = nextOwnTurn ? nextOwnTurn.markTimeMs : nextPendingMarkTimeMs;
     // Built-in scheduled turns MUST NOT run this pre-text gate: without
     // finalText the gate treats "any in-window marker" as already-delivered
     // (empty final is covered by a single progress send), so a turn that sent
@@ -17017,6 +17028,63 @@ function postTerminalPromptFenceHolds(
   }
 }
 
+/** Claude transcript turn boundary, for the stale OSC 7501 fallback below. */
+const claudeTranscriptTurnEnd = new ClaudeTranscriptTurnEnd();
+let staleProgramStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** The transcript just closed a turn: make sure an OSC 7501 `working` hold
+ *  that outlives it gets looked at (see utils/stale-program-status.ts). */
+function scheduleStaleProgramStatusCheck(): void {
+  if (staleProgramStatusTimer) return;
+  staleProgramStatusTimer = setTimeout(() => {
+    staleProgramStatusTimer = null;
+    checkStaleProgramStatus();
+  }, STALE_PROGRAM_STATUS_CHECK_MS);
+  staleProgramStatusTimer.unref?.();
+}
+
+function checkStaleProgramStatus(): void {
+  const detector = idleDetector;
+  const be = backend;
+  if (!detector || !be) return;
+  const now = Date.now();
+  const evidence = {
+    heldWorking: detector.programStatusHeldWorking(),
+    programStatusQuietMs: detector.programStatusQuietMs(now),
+    transcriptEndedForMs: claudeTranscriptTurnEnd.endedForMs(now),
+  };
+  const verdict = staleProgramStatusVerdict(evidence);
+  if (verdict === 'stop') return;
+  if (verdict === 'wait' || !viewportShowsIdlePrompt(be)) {
+    scheduleStaleProgramStatusCheck();
+    return;
+  }
+  if (!detector.releaseStaleProgramStatus()) return;
+  log(`[program-status] working held ${Math.round(evidence.programStatusQuietMs / 1000)}s with no report while the `
+    + `transcript closed the turn ${Math.round(evidence.transcriptEndedForMs! / 1000)}s ago and the screen is at the prompt `
+    + '— treating the lost terminal report as idle');
+}
+
+/** Screen fallback only: the authoritative viewport shows the CLI's idle
+ *  prompt and none of its busy markers. */
+function viewportShowsIdlePrompt(be: SessionBackend): boolean {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (cliAdapter.isSessionBusy?.({ sessionId, cliSessionId: currentCliSid, getCurrentScreen: () => captureBackendScreen(be) })) {
+    return false;
+  }
+  try {
+    const content = captureBackendScreen(be);
+    if (!content) return false;
+    const region = busyProbeRegion(content);
+    if (cliAdapter.busyPattern.test(region)) return false;
+    return !cliAdapter.readyPattern || cliAdapter.readyPattern.test(region);
+  } catch (err: any) {
+    log(`stale program-status viewport capture failed: ${err.message}`);
+    return false;
+  }
+}
+
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
@@ -21991,6 +22059,8 @@ async function spawnCli(
       if (backend !== observedBackend || !backendScreenEvidenceIsAuthoritativeForMutation()) return '';
       return stripAnsiScreenText(captureBackendScreen(observedBackend));
     });
+    // A new CLI process starts with no closed turn of its own.
+    claudeTranscriptTurnEnd.reset();
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
     idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
