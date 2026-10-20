@@ -7926,6 +7926,7 @@ describe('PUT /api/bot-agent', () => {
 
     // Opt-in browser integration: real React controls and real HTTP IPC writer;
     // only unrelated catalog endpoints and the Dashboard proxy hop are stubbed.
+    // 非文本断言：真实 style.css 只是交给浏览器渲染，断言的是控件交互与 IPC 写入结果。
     it.skipIf(process.env.BOTMUX_WRAPPER_BROWSER !== '1')('saves and explicitly replaces a wrapper through real browser controls', async () => {
       const { chromium } = await import('playwright');
       const { build } = await import('esbuild');
