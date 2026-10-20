@@ -43,6 +43,26 @@ describe('源码文本扫描器', () => {
         const src = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
         it('t', () => { expect(src).toMatch(/x/); });
       });`],
+    ['带路径形参的读取函数，调用处传 src 路径', `
+      const REPO = join(__dirname, '..');
+      function source(rel: string) { return readFileSync(join(REPO, rel), 'utf8'); }
+      it('t', () => { expect(source('src/daemon.ts')).toContain('x'); });`],
+    ['遍历 src 路径数组的循环变量', `
+      for (const rel of ['src/worker.ts', 'src/daemon.ts']) {
+        it('t', () => { expect(readFileSync(resolve(rel), 'utf8')).not.toMatch(/x/); });
+      }`],
+    ['it.each 的 src 路径表', `
+      it.each(['src/a.ts', 'src/b.ts'])('t', file => { expect(readFileSync(file, 'utf8')).toContain('x'); });`],
+    ['模板字符串里插值之后的 /src/', `
+      const repoRoot = join(__dirname, '..');
+      it('t', () => { expect(readFileSync(\`\${repoRoot}/src/worker.ts\`, 'utf8')).toContain('x'); });`],
+    ['递归遍历 src 目录的读取函数', `
+      const srcRoot = new URL('../src/', import.meta.url);
+      function walk(dir: URL): string[] { return readdirSync(dir).map(name => readFileSync(new URL(name, dir), 'utf8')); }
+      it('t', () => { expect(walk(srcRoot).join('')).not.toContain('x'); });`],
+    ['字符串里出现 Function( 不会被当成执行', `
+      const worker = readFileSync('src/worker.ts', 'utf8');
+      it('t', () => { expect(worker).not.toContain('new Function(a)'); });`],
   ])('识别：%s', (_label, source) => {
     expect(scan(source)).toEqual([{ title: 't', marked: false }]);
   });
@@ -63,6 +83,9 @@ describe('源码文本扫描器', () => {
       const worker = readFileSync('src/worker.ts', 'utf8');
       const load = (name: string) => new Function(worker.slice(worker.indexOf(name)))();
       it('t', () => { expect(load('decide')(1)).toBe(2); });`],
+    ['读取函数的其它参数里出现 src 路径（拿去 spawn）', `
+      async function runInPane(argv: string[], resultPath: string) { spawn(argv); return readFileSync(resultPath, 'utf8'); }
+      it('t', async () => { expect(await runInPane(['bun', join(ROOT, 'src/relay.ts')], out)).toBe('ok'); });`],
     ['src 下的 JSON 数据文件当夹具', `
       it('t', () => { expect(plan(JSON.parse(readFileSync('src/setup/lark-scopes.json', 'utf8')))).toEqual([]); });`],
   ])('不误报：%s', (_label, source) => {
