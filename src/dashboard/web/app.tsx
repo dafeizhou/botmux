@@ -2,7 +2,7 @@
 import type React from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
 import {
@@ -57,6 +57,8 @@ import {
   NO_WORKBENCH_CAPABILITIES,
   parseWorkbenchCapabilities,
 } from './agent-workbench-capabilities.js';
+import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
+import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -281,6 +283,25 @@ function sidebarNavItems(): NavItem[] {
   ];
 }
 
+/** ⌘K 面板的「页面」条目：与侧边栏同一份可见性（权限 / 客户端壳 / pinned 插件）。 */
+function paletteNavPages(): PalettePageEntry[] {
+  const groupOf = new Map<string, string>();
+  for (const group of NAV_GROUPS) for (const id of group.items) groupOf.set(id, group.labelKey);
+  return sidebarNavItems()
+    .filter(item => isAuthed || !item.manage)
+    .map(item => {
+      const groupKey = groupOf.get(item.plugin ? 'plugins' : item.id);
+      return {
+        id: item.id,
+        href: item.href,
+        label: labelOf(item),
+        labelKey: item.labelKey,
+        groupLabel: groupKey ? t(groupKey) : undefined,
+        icon: item.icon,
+      };
+    });
+}
+
 function navClassName(item: NavItem): string | undefined {
   const classes = [];
   if (isActiveNav(item, activeHash)) classes.push('active');
@@ -474,6 +495,47 @@ function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.E
         <span>{t('overview.openSessions')}</span>
       </div>
     </div>
+  );
+}
+
+// ── ⌘K 全局搜索 ─────────────────────────────────────────────────────────────
+// 壳层只负责唤起（快捷键 + 顶栏入口）；面板本体是独立 chunk，首次唤起或空闲时预取。
+const PALETTE_MAC = typeof navigator !== 'undefined' && isMacLike(
+  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || '',
+);
+type CommandPaletteModule = typeof import('./command-palette.js');
+let commandPaletteModule: Promise<CommandPaletteModule> | null = null;
+
+function loadCommandPalette(): Promise<CommandPaletteModule> {
+  commandPaletteModule ??= import('./command-palette.js').catch(error => {
+    commandPaletteModule = null;
+    throw error;
+  });
+  return commandPaletteModule;
+}
+
+function preloadCommandPalette(): void {
+  void loadCommandPalette().catch(() => { /* 真正唤起时再报错 */ });
+}
+
+function CommandPaletteTrigger(props: { onOpen(): void }): React.JSX.Element {
+  const shortcut = paletteShortcutLabel(PALETTE_MAC);
+  return (
+    <button
+      type="button"
+      className="topbar-search-trigger"
+      aria-haspopup="dialog"
+      aria-keyshortcuts={PALETTE_MAC ? 'Meta+K' : 'Control+K'}
+      aria-label={`${t('palette.dialogLabel')} (${shortcut})`}
+      title={`${t('palette.dialogLabel')} (${shortcut})`}
+      onPointerEnter={preloadCommandPalette}
+      onFocus={preloadCommandPalette}
+      onClick={props.onOpen}
+    >
+      {icon(<><circle cx="7" cy="7" r="4.6" /><path d="m10.4 10.4 3.6 3.6" /></>)}
+      <span className="topbar-search-text">{t('palette.triggerPlaceholder')}</span>
+      <kbd className="topbar-search-kbd" aria-hidden="true">{shortcut}</kbd>
+    </button>
   );
 }
 
@@ -1340,6 +1402,32 @@ function DashboardShell(): React.JSX.Element {
   const [statusAutoOpen, setStatusAutoOpen] = useState(false);
   const previousAttentionRef = useRef(statusSummary.attention);
   const statusAutoOpenTimerRef = useRef<number | null>(null);
+  // 每次唤起 seq+1 作为面板的 key：重新挂载 = 查询 / 分类 / 选中项从零开始。
+  const [palette, setPalette] = useState<{ open: boolean; seq: number }>({ open: false, seq: 0 });
+  const [PaletteView, setPaletteView] = useState<CommandPaletteModule['CommandPalette'] | null>(null);
+  const paletteOpenRef = useRef(false);
+  const paletteEnabledRef = useRef(true);
+  paletteOpenRef.current = palette.open;
+
+  const closePalette = useCallback(() => setPalette(prev => (prev.open ? { ...prev, open: false } : prev)), []);
+  // 允许叠在会话详情抽屉等原生模态框之上：面板 showModal 后是 top layer 最上层，
+  // Esc 只关它自己；选中跳转会换 hash 重挂载页面，底下的抽屉随之卸掉。
+  const openPalette = useCallback(() => {
+    void loadCommandPalette()
+      .then(mod => {
+        setPaletteView(() => mod.CommandPalette);
+        setPalette(prev => (prev.open ? prev : { open: true, seq: prev.seq + 1 }));
+      })
+      .catch(error => {
+        if (maybeReloadBrowserForStaleRouteChunk(error, {
+          href: window.location.href,
+          hash: location.hash || '#/',
+          getSessionStorage: () => window.sessionStorage,
+          reload: () => window.location.reload(),
+        })) return;
+        console.error('botmux command palette failed to load', error);
+      });
+  }, []);
 
   const clearStatusAutoOpenTimer = () => {
     if (statusAutoOpenTimerRef.current === null) return;
@@ -1363,6 +1451,19 @@ function DashboardShell(): React.JSX.Element {
   useEffect(() => {
     return () => clearStatusAutoOpenTimer();
   }, []);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || !isPaletteHotkey(event, PALETTE_MAC)) return;
+      if (!paletteEnabledRef.current) return;
+      // 宿主终端（xterm）里 Ctrl+K 是 readline 删到行尾，xterm 自己处理后会拦下；这里再兜一层。
+      if (event.target instanceof Element && event.target.closest('.xterm')) return;
+      event.preventDefault();
+      if (paletteOpenRef.current) closePalette();
+      else openPalette();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [closePalette, openPalette]);
   useEffect(() => {
     const previousAttention = previousAttentionRef.current;
     previousAttentionRef.current = statusSummary.attention;
@@ -1398,6 +1499,14 @@ function DashboardShell(): React.JSX.Element {
         ? 'appCenter'
         : null
     : null;
+  // 无边框工作台壳没有顶栏，也不挂面板。
+  paletteEnabledRef.current = !workbenchSurface;
+  const paletteContext: PaletteShellContext = {
+    pages: palette.open ? paletteNavPages() : [],
+    setLocale,
+    openCreateSession: requestOpenCreateSession,
+    openCreateBot: () => { void openBotOnboarding(); },
+  };
   if (workbenchSurface) {
     return (
       <>
@@ -1435,6 +1544,9 @@ function DashboardShell(): React.JSX.Element {
               </a>
               <TopbarVersionControl status={botmuxUpdateStatus} onRefresh={() => checkUpdateBadge(true)} />
             </div>
+          </div>
+          <div className="topbar-center">
+            <CommandPaletteTrigger onOpen={openPalette} />
           </div>
           <div className="topbar-actions">
             <TopbarStatusMenu summary={statusSummary} autoOpen={statusAutoOpen} />
@@ -1527,6 +1639,15 @@ function DashboardShell(): React.JSX.Element {
         loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
         onClose={closeAuthExpired}
       />
+      {PaletteView ? (
+        <PaletteView
+          key={palette.seq}
+          open={palette.open}
+          onClose={closePalette}
+          mac={PALETTE_MAC}
+          context={paletteContext}
+        />
+      ) : null}
       {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关） */}
       <ToastStack />
       <ConfirmModalRoot />
@@ -1854,6 +1975,9 @@ void (async () => {
   }
   void loadNameMaps().then(renderShell);
   void loadGroupsSnapshot().then(renderShell);
+  // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络。
+  if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(preloadCommandPalette, { timeout: 5_000 });
+  else window.setTimeout(preloadCommandPalette, 3_000);
   window.addEventListener('hashchange', () => {
     if (!applyShellLocaleFromHash()) void route();
   });

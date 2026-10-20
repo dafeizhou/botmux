@@ -379,6 +379,11 @@ export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
 }
 
+/** 注册表里已知友好名的全部 bot（⌘K 面板的「机器人」条目）；loadNameMaps / 本地缓存回灌后才有。 */
+export function knownBots(): Array<{ larkAppId: string; name: string }> {
+  return [...botNameByAppId.entries()].map(([larkAppId, name]) => ({ larkAppId, name }));
+}
+
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */
 export function botDisplayName(s: Record<string, any>): string {
   const mapped = s.larkAppId ? botNameByAppId.get(s.larkAppId) : undefined;
