@@ -113,45 +113,62 @@ function sessionBadge(s: Record<string, any>): { text: string; tone: PaletteTone
   return { text: sessionStatusLabel(status), tone: 'idle' };
 }
 
-export function buildSessionItems(rows: Iterable<Record<string, any>>, now = Date.now()): PaletteItem[] {
+/**
+ * `cache` 以会话行对象为键：store 更新只替换变化的那一行，面板开着时每条 SSE 就只重建
+ * 一个条目（数千会话下整表重建 + 重新小写化要几十毫秒）。缓存由面板实例持有、每次唤起
+ * 重建，所以条目里的相对时间不会跨次唤起过期。
+ */
+export function buildSessionItems(
+  rows: Iterable<Record<string, any>>,
+  now = Date.now(),
+  cache?: WeakMap<object, PaletteItem>,
+): PaletteItem[] {
   return orderSessionsForPalette(rows).map(s => {
-    const id = String(s.sessionId);
-    const closed = s.status === 'closed';
-    const location = chatDisplayTitle(s) ?? (s.chatType === 'p2p' ? t('sessions.directChat') : '');
-    const repo = compact(s.workspace?.displayName, 40) || basename(s.workingDir);
-    const title = compact(stripMentionPrefix(s.title), 120) || location || id;
-    const lastActive = sessionLastActive(s);
-    const ageDays = lastActive ? Math.max(0, (now - lastActive) / 86_400_000) : 30;
-    const recency = Math.max(0, 1 - ageDays / 30);
-    const feishuLink = String(s.feishuThreadLink || s.feishuChatLink || '');
-    const item: PaletteItem = {
-      key: `session:${id}`,
-      kind: 'session',
-      title,
-      subtitle: [botDisplayName(s), location, repo, s.cliId].filter(Boolean).join(' · '),
-      keywords: [
-        id,
-        s.chatId,
-        s.title,
-        s.workingDir,
-        s.workspace?.rootPath,
-        s.workspace?.branch,
-        s.larkAppId,
-        s.botName,
-      ].filter(Boolean).map(String),
-      meta: lastActive ? relTime(lastActive) : undefined,
-      badge: sessionBadge(s),
-      avatar: { name: botDisplayName(s), larkAppId: s.larkAppId },
-      boost: (closed ? 0.1 : 0.6) + recency * 0.3 + (attentionReason(s) ? 0.1 : 0),
-      primary: { label: t('palette.actionOpenSession'), href: sessionDetailHref(id) },
-    };
-    if (!closed && ui.workbenchAuthed) {
-      item.secondary = { label: t('palette.actionOpenWorkbench'), href: workbenchSessionHref(id) };
-    } else if (feishuLink.startsWith('https://')) {
-      item.secondary = { label: t('palette.actionOpenFeishu'), href: feishuLink, external: true };
-    }
+    const cached = cache?.get(s);
+    if (cached) return cached;
+    const item = buildSessionItem(s, now);
+    cache?.set(s, item);
     return item;
   });
+}
+
+function buildSessionItem(s: Record<string, any>, now: number): PaletteItem {
+  const id = String(s.sessionId);
+  const closed = s.status === 'closed';
+  const location = chatDisplayTitle(s) ?? (s.chatType === 'p2p' ? t('sessions.directChat') : '');
+  const repo = compact(s.workspace?.displayName, 40) || basename(s.workingDir);
+  const title = compact(stripMentionPrefix(s.title), 120) || location || id;
+  const lastActive = sessionLastActive(s);
+  const ageDays = lastActive ? Math.max(0, (now - lastActive) / 86_400_000) : 30;
+  const recency = Math.max(0, 1 - ageDays / 30);
+  const feishuLink = String(s.feishuThreadLink || s.feishuChatLink || '');
+  const item: PaletteItem = {
+    key: `session:${id}`,
+    kind: 'session',
+    title,
+    subtitle: [botDisplayName(s), location, repo, s.cliId].filter(Boolean).join(' · '),
+    keywords: [
+      id,
+      s.chatId,
+      s.title,
+      s.workingDir,
+      s.workspace?.rootPath,
+      s.workspace?.branch,
+      s.larkAppId,
+      s.botName,
+    ].filter(Boolean).map(String),
+    meta: lastActive ? relTime(lastActive) : undefined,
+    badge: sessionBadge(s),
+    avatar: { name: botDisplayName(s), larkAppId: s.larkAppId },
+    boost: (closed ? 0.1 : 0.6) + recency * 0.3 + (attentionReason(s) ? 0.1 : 0),
+    primary: { label: t('palette.actionOpenSession'), href: sessionDetailHref(id) },
+  };
+  if (!closed && ui.workbenchAuthed) {
+    item.secondary = { label: t('palette.actionOpenWorkbench'), href: workbenchSessionHref(id) };
+  } else if (feishuLink.startsWith('https://')) {
+    item.secondary = { label: t('palette.actionOpenFeishu'), href: feishuLink, external: true };
+  }
+  return item;
 }
 
 // ── Skill / Agent / 机器人 ───────────────────────────────────────────────────

@@ -79,6 +79,9 @@ describe('command palette model: matching', () => {
     expect(matchItem(proxy, ['dwnld'])).toBeNull();
     // CJK 没有词边界：副标题 / 关键词里的中文子串照常命中。
     expect(matchItem(proxy, ['维护'])).not.toBeNull();
+    // 粗筛不能误杀标题上的模糊匹配。
+    const control = item({ key: 'page:sessions', kind: 'page', title: 'Session Control' });
+    expect(matchItem(control, ['sesctl'])!.titleRanges.length).toBeGreaterThan(0);
   });
 
   it('requires every query word to match (AND) and keeps title highlights per word', () => {
@@ -225,6 +228,20 @@ describe('command palette sources', () => {
     expect(active!.secondary).toMatchObject({ href: '#/agent-workbench/a%2F1' });
     expect(closed!.secondary).toMatchObject({ href: 'https://applink.feishu.cn/x', external: true });
     expect(closedNoLink!.secondary).toBeUndefined();
+  });
+
+  it('rebuilds only the session rows that changed when given a cache', () => {
+    const rows = [
+      { sessionId: 'a', status: 'working', title: 'one', lastMessageAt: now },
+      { sessionId: 'b', status: 'idle', title: 'two', lastMessageAt: now - 1 },
+    ];
+    const cache = new WeakMap<object, PaletteItem>();
+    const first = buildSessionItems(rows, now, cache);
+    const updated = [rows[0]!, { ...rows[1]!, title: 'two renamed' }];
+    const second = buildSessionItems(updated, now, cache);
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).not.toBe(first[1]);
+    expect(second[1]!.title).toBe('two renamed');
   });
 
   it('every indexed settings key is translated in both locales', () => {

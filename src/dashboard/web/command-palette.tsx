@@ -219,11 +219,18 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
     [authed],
   );
 
-  const sessionItems = useMemo(
-    () => (open ? buildSessionItems(snapshot.sessions.values()) : []),
+  // 每次唤起都是新实例：会话条目按行对象缓存到本次关闭为止，相对时间以唤起时刻为准。
+  const sessionCacheRef = useRef<{ key: string; now: number; items: WeakMap<object, PaletteItem> } | null>(null);
+  const sessionItems = useMemo(() => {
+    if (!open) return [];
+    const cacheKey = `${locale}:${ui.workbenchAuthed}`;
+    if (sessionCacheRef.current?.key !== cacheKey) {
+      sessionCacheRef.current = { key: cacheKey, now: Date.now(), items: new WeakMap() };
+    }
+    const cache = sessionCacheRef.current;
+    return buildSessionItems(snapshot.sessions.values(), cache.now, cache.items);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- store 原地更新 Map，version 才是变化信号
-    [open, snapshot.version, locale, authed],
-  );
+  }, [open, snapshot.version, locale, authed]);
   const remoteItems = useMemo(() => (open && authed ? [
     ...buildSkillItems(remote.skills ?? []),
     ...buildAgentItems(remote.agents?.agents ?? [], remote.agents?.links ?? {}),

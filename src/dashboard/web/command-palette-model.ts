@@ -220,6 +220,8 @@ interface PreparedFields {
   title: string;
   subtitle: string;
   keywords: string[];
+  /** 全部字段拼成的一串：token 不在其中、又不够格做标题模糊匹配的条目直接跳过。 */
+  haystack: string;
   /** toLowerCase 改变了长度（极少数 Unicode）时下标对不上，放弃该字段高亮。 */
   titleAligned: boolean;
   subtitleAligned: boolean;
@@ -232,10 +234,12 @@ function prepare(item: PaletteItem): PreparedFields {
   if (!fields) {
     const title = item.title.toLowerCase();
     const subtitle = (item.subtitle ?? '').toLowerCase();
+    const keywords = (item.keywords ?? []).filter(Boolean).map(k => String(k).toLowerCase());
     fields = {
       title,
       subtitle,
-      keywords: (item.keywords ?? []).filter(Boolean).map(k => String(k).toLowerCase()),
+      keywords,
+      haystack: [title, subtitle, ...keywords].join('\n'),
       titleAligned: title.length === item.title.length,
       subtitleAligned: subtitle.length === (item.subtitle ?? '').length,
     };
@@ -260,6 +264,8 @@ export function matchItem(item: PaletteItem, tokens: readonly string[]): ItemMat
   let total = 0;
   let allInTitle = true;
   for (const token of tokens) {
+    // 粗筛：任何字段都不含这个 token 时，只剩标题模糊匹配一条路（短 token / CJK 连它也没有）。
+    if (!fields.haystack.includes(token) && (token.length < 3 || !ASCII_PRINTABLE_RE.test(token))) return null;
     const inTitle = matchToken(fields.title, token);
     const inSubtitle = hiddenFieldMatch(fields.subtitle, token);
     let best = inTitle ? inTitle.score * TITLE_WEIGHT : 0;
