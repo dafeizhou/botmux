@@ -2,7 +2,7 @@
 import type React from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
 import {
@@ -516,6 +516,10 @@ function loadCommandPalette(): Promise<CommandPaletteModule> {
 
 function preloadCommandPalette(): void {
   void loadCommandPalette().catch(() => { /* 真正唤起时再报错 */ });
+}
+
+function openCreateBotFromPalette(): void {
+  void openBotOnboarding();
 }
 
 function CommandPaletteTrigger(props: { onOpen(): void }): React.JSX.Element {
@@ -1501,12 +1505,14 @@ function DashboardShell(): React.JSX.Element {
     : null;
   // 无边框工作台壳没有顶栏，也不挂面板。
   paletteEnabledRef.current = !workbenchSurface;
-  const paletteContext: PaletteShellContext = {
+  // 壳层随每条 SSE 重渲染；context 换新对象会让面板重建全部条目并重跑整次搜索。
+  // 只有页面清单可能变化时才换：开关面板、切语言、登录态、置顶插件、宿主终端权限。
+  const paletteContext = useMemo<PaletteShellContext>(() => ({
     pages: palette.open ? paletteNavPages() : [],
     setLocale,
     openCreateSession: requestOpenCreateSession,
-    openCreateBot: () => { void openBotOnboarding(); },
-  };
+    openCreateBot: openCreateBotFromPalette,
+  }), [palette.open, ui.locale, isAuthed, pinnedPluginNavItems, ui.hostTerminal]);
   if (workbenchSurface) {
     return (
       <>
