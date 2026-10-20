@@ -479,6 +479,8 @@ function probe(code: string): ts.SourceFile {
   return ts.createSourceFile('probe.ts', code, ts.ScriptTarget.Latest, true);
 }
 
+// 源码结构护栏(K4)：src 里每个 close 调用点与 close 路由响应点都必须登记在矩阵里并归类；调用点散落在各处闭包里，
+// 只能扫源码核对（同文件下半部分的自检保证扫描器对别名 / 命名空间 / 动态 import 与注释字符串的判定）。
 describe('close consumer matrix (call-site)', () => {
   it('every close call site is classified', () => {
     const unclassified = [...new Set(

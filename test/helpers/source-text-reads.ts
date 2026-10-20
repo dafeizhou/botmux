@@ -28,6 +28,7 @@ export interface SourceTextRead {
 export const GUARD_MARKER = /源码结构护栏\s*[（(]\s*K[1-4]|非文本断言\s*[：:]/;
 
 const READ_CALLEE = /(^|\.)(readFileSync|readFile)$/;
+const ITERATORS = /^(forEach|map|flatMap|filter|some|every|find|reduce)$/;
 const TEST_CALLEE = /^(it|test)(\.(each|skip|only|concurrent|fails|skipIf|runIf|todo))?$/;
 const SUITE_CALLEE = /^describe(\.(each|skip|only|concurrent|skipIf|runIf))?$/;
 /** 字面量里出现 `src/...`、`../src/...`，或者作为 join 的一段单独出现 `'src'`。 */
@@ -133,14 +134,19 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
 
   // 模块级（不在用例回调内）的声明：变量初始化式与函数体。
   const decls: Array<[string, ts.Node, 'var' | 'fn']> = [];
-  const loopSrcPaths = new Set<string>();
+  // for (const rel of <src 路径的数组>) —— 循环变量就是 src 路径（在下面的迭代里判定）。
+  const forOfs: Array<[string, ts.Expression]> = [];
+  // 对象字面量里的方法（`{ read: (p) => readFileSync(…) }`、`{ read(p) { … } }`）。
+  const methods: Array<[string, ts.Node]> = [];
   const collect = (n: ts.Node, inTest: boolean) => {
     if (ts.isCallExpression(n) && TEST_CALLEE.test(calleeName(n))) inTest = true;
-    // for (const rel of ['src/a.ts', 'src/b.ts']) —— 循环变量就是 src 路径。
     if (ts.isForOfStatement(n) && ts.isVariableDeclarationList(n.initializer)) {
       const decl = n.initializer.declarations[0];
-      if (decl && ts.isIdentifier(decl.name) && hasSrcPiece(n.expression)) loopSrcPaths.add(decl.name.text);
+      if (decl && ts.isIdentifier(decl.name)) forOfs.push([decl.name.text, n.expression]);
     }
+    if (ts.isPropertyAssignment(n) && (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name))
+      && (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) methods.push([n.name.text, n.initializer]);
+    if (ts.isMethodDeclaration(n) && ts.isIdentifier(n.name) && n.body && ts.isObjectLiteralExpression(n.parent)) methods.push([n.name.text, n.body]);
     if (!inTest) {
       if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) decls.push([n.name.text, n.initializer, 'var']);
       if (ts.isFunctionDeclaration(n) && n.name && n.body) decls.push([n.name.text, n.body, 'fn']);
@@ -151,12 +157,25 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
 
   // 仓库根锚点变量（repoRoot = join(__dirname, '..') 之类）与指向 src 的路径变量。
   const anchors = new Set<string>();
-  const srcPaths = new Set<string>(loopSrcPaths);
+  // 指向 src 的路径变量、src 路径数组，以及返回 src 路径的函数（`srcPath = f => join(ROOT, 'src', f)`）。
+  const srcPaths = new Set<string>();
   // 读出来的源码文本，或者返回源码文本的函数。
   const sourceText = new Set<string>();
   // 按参数路径读文件的通用读取函数（`const read = (p) => readFileSync(join(ROOT, p))`）：
   // 调用处传入 src 路径字面量时，等同于直接读源码。
   const readers = new Map<string, Set<number>>();
+  const methodReaders = new Map<string, Set<number>>();
+
+  /** 读取函数的实参是否指向 src：src 路径变量，或自带 src 段的相对路径（不含 JSON 数据文件）。 */
+  const isSrcArg = (arg: ts.Node): boolean => {
+    if (stringPieces(arg).some(p => /\.json$/.test(p))) return false;
+    if (mentions(arg, srcPaths)) return true;
+    if (!hasSrcPiece(arg)) return false;
+    if (ts.isStringLiteralLike(arg)) return true;
+    // join('src', f) / resolve('src/x.ts')：第一段就是 src，没有别的基准目录（临时目录下自建的 src 不算）。
+    const first = ts.isCallExpression(arg) && /(^|\.)(resolve|join)\w*$/i.test(arg.expression.getText()) ? arg.arguments[0] : undefined;
+    return first !== undefined && ts.isStringLiteralLike(first) && (SRC_SEGMENT.test(first.text) || first.text === 'src');
+  };
 
   const isRepoSrcPath = (expr: ts.Node): boolean => {
     const pieces = stringPieces(expr);
@@ -193,26 +212,55 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
         return;
       }
       // 只看流进读取的那个参数位置：同一个函数的其它参数里出现 src 路径（比如拿去 spawn）不算。
-      const readIndexes = ts.isCallExpression(n) && ts.isIdentifier(n.expression) && !shadowed.has(n.expression.text)
-        ? readers.get(n.expression.text) : undefined;
+      const readIndexes = !ts.isCallExpression(n) ? undefined
+        : ts.isIdentifier(n.expression) ? (shadowed.has(n.expression.text) ? undefined : readers.get(n.expression.text))
+          : ts.isPropertyAccessExpression(n.expression) ? methodReaders.get(n.expression.name.text) : undefined;
       if (readIndexes && [...readIndexes].some(i => {
         const arg = (n as ts.CallExpression).arguments[i];
-        return arg !== undefined && (hasSrcPiece(arg) || mentions(arg, srcPaths));
+        return arg !== undefined && isSrcArg(arg);
       })) {
         hit = true;
         return;
       }
+      // files.forEach(f => readFileSync(f))：遍历 src 路径数组时，回调形参就是 src 路径。
+      const iterated = ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)
+        && ITERATORS.test(n.expression.name.text) && isSrcCollection(n.expression.expression)
+        ? n.arguments.find(a => ts.isArrowFunction(a) || ts.isFunctionExpression(a)) as ts.ArrowFunction | undefined
+        : undefined;
+      const added = iterated ? iterated.parameters.flatMap(p => ts.isIdentifier(p.name) && !srcPaths.has(p.name.text) ? [p.name.text] : []) : [];
+      for (const name of added) srcPaths.add(name);
       ts.forEachChild(n, visit);
+      for (const name of added) srcPaths.delete(name);
     };
     visit(node);
     return hit || mentions(node, visible);
+  };
+
+  /** src 路径的数组：字面量数组里有 src 路径，或者就是一个 src 路径数组变量。 */
+  const isSrcCollection = (expr: ts.Node): boolean =>
+    (ts.isArrayLiteralExpression(expr) && expr.elements.some(e => isRepoSrcPath(e))) || mentions(expr, srcPaths);
+
+  /** 返回 src 路径的函数：箭头函数的表达式体或任一 return 是仓库 src 路径。 */
+  const returnsSrcPath = (node: ts.Node): boolean => {
+    const fn = ts.isArrowFunction(node) || ts.isFunctionExpression(node) ? node
+      : ts.isBlock(node) && ts.isFunctionDeclaration(node.parent) ? node.parent : undefined;
+    if (!fn?.body) return false;
+    if (!ts.isBlock(fn.body)) return isRepoSrcPath(fn.body);
+    let found = false;
+    const visit = (n: ts.Node) => {
+      if (found || ts.isFunctionLike(n)) return;
+      if (ts.isReturnStatement(n) && n.expression && isRepoSrcPath(n.expression)) { found = true; return; }
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(fn.body, visit);
+    return found;
   };
 
   // 函数的读文件路径由它自己的某个形参决定（`read(rel)`、递归的 `walk(dir)`）。
   /** 返回流进读取路径的形参下标；不是读取函数时返回空集。 */
   const pathReaderParams = (node: ts.Node): Set<number> => {
     const fn = ts.isArrowFunction(node) || ts.isFunctionExpression(node) ? node
-      : ts.isBlock(node) && ts.isFunctionDeclaration(node.parent) ? node.parent : undefined;
+      : ts.isBlock(node) && (ts.isFunctionDeclaration(node.parent) || ts.isMethodDeclaration(node.parent)) ? node.parent : undefined;
     const indexes = new Set<number>();
     if (!fn) return indexes;
     const visit = (n: ts.Node) => {
@@ -236,6 +284,10 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
     const indexes = pathReaderParams(init);
     if (indexes.size > 0) readerCandidates.set(init, indexes);
   }
+  for (const [name, fn] of methods) {
+    const indexes = pathReaderParams(fn);
+    if (indexes.size > 0) methodReaders.set(name, new Set([...(methodReaders.get(name) ?? []), ...indexes]));
+  }
 
   // 迭代到不动点：锚点 → 路径 → 文本，彼此可以层层引用。
   for (let round = 0; round < 5; round++) {
@@ -249,8 +301,13 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
         }
         if (!srcPaths.has(name) && isRepoSrcPath(init)) { srcPaths.add(name); changed = true; }
       }
+      if (kind === 'var' && !srcPaths.has(name) && ts.isArrayLiteralExpression(init) && isSrcCollection(init)) { srcPaths.add(name); changed = true; }
+      if (!srcPaths.has(name) && !readerCandidates.has(init) && returnsSrcPath(init)) { srcPaths.add(name); changed = true; }
       if (!readers.has(name) && readerCandidates.has(init)) { readers.set(name, readerCandidates.get(init)!); changed = true; }
       if (!sourceText.has(name) && readsSource(init)) { sourceText.add(name); changed = true; }
+    }
+    for (const [name, expr] of forOfs) {
+      if (!srcPaths.has(name) && (hasSrcPiece(expr) ? isSrcCollection(expr) || isRepoSrcPath(expr) : mentions(expr, srcPaths))) { srcPaths.add(name); changed = true; }
     }
     if (!changed) break;
   }
@@ -269,7 +326,7 @@ export function findSourceTextReads(file: string, text: string): SourceTextRead[
         const body = call.arguments.find(a => ts.isArrowFunction(a) || ts.isFunctionExpression(a));
         // it.each(['src/a.ts', …])('…', file => …)：表里是 src 路径时，回调形参就是 src 路径。
         const eachTable = ts.isCallExpression(call.expression) ? call.expression.arguments : undefined;
-        const eachParams = body && eachTable?.some(arg => hasSrcPiece(arg))
+        const eachParams = body && eachTable?.some(arg => isSrcCollection(arg) || hasSrcPiece(arg))
           ? (body as ts.ArrowFunction).parameters.flatMap(param => ts.isIdentifier(param.name) ? [param.name.text] : [])
           : [];
         for (const name of eachParams) srcPaths.add(name);

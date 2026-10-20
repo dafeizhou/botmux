@@ -93,4 +93,4 @@
 | `test/worker-backend-exit-crash-order.test.ts` | 1 | 把 spawnCli 里的 backend.onExit 回调抽成接受 (observedBackend, 当前 backend, durable 状态) 的函数 |
 | `test/turn-idle-channel.test.ts` | 3 | 把 cmdTurnIdle 的 origin 解析（有 frozen origin 时直接用它、不回溯 live marker 与 env 兜底）抽成纯函数；把 worker 按 `injectsTurnIdleHook` 注入或清除 `BOTMUX_TURN_IDLE_COMMAND` 的 env 组装抽成纯函数；`__turn-idle-v2` 子命令注册与 workflow subagent 白名单用一次 CLI 级 spawn 测试覆盖 |
 | `test/cursor-cot-wiring.test.ts` | 3 | 把 Cursor CoT 读取器的三个启动/停止接线点（observeCursorCliSessionId、cursorBridgeAttach 与排队轮次的 prepareNormalWrite、stopCodexBridge）收拢成一个可注入 start/stop 的生命周期对象 |
-| `test/usage-refresh-timer-wiring.test.ts` | 6 | 把 worker-pool 里 screen_update / ready / screenshot_uploaded / worker exit / postFreshStreamingCard 对用量刷新定时器的 arm/clear 决策抽成一个以（事件, ds 状态）为输入的纯函数；`refreshStreamingCardUsage` 在 port=0 后端不渲染终端链接可直接在 recall-frozen-cards 补一条 |
+| `test/usage-refresh-timer-wiring.test.ts` | 6 | 把 worker-pool 里 screen_update / ready / screenshot_uploaded / worker exit / postFreshStreamingCard 对用量刷新定时器的 arm/clear 决策抽成一个以（事件, ds 状态）为输入的纯函数（谓词、fresh 读取与 port=0 不渲染终端链接已由 recall-frozen-cards 的行为测试覆盖） |
