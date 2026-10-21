@@ -4822,7 +4822,13 @@ function staleWorkingCardSweepMarker(larkAppId: string): string {
  *  them any more — see staleWorkingCardIds. Each is withdrawn, as the normal
  *  flow withdraws an old turn's card once its successor is live. Live and
  *  frozen (to-be-recalled) cards of every session of this bot are kept, and so
- *  is anything posted at or after `postedBefore` (the restore boundary). */
+ *  is anything posted at or after `postedBefore` (the restore boundary).
+ *
+ *  This is a migration, not a continuous sweep: the marker is written after the
+ *  first pass whatever it found, so it never runs again for this bot. That pass
+ *  only sees the containers of sessions active at that startup, the newest
+ *  STALE_WORKING_CARD_SCAN messages of each, and skips a container whose listing
+ *  fails. The fixes in this change stop new orphans from being produced. */
 export async function sweepStaleWorkingCards(larkAppId: string, postedBefore: number = Date.now()): Promise<void> {
   if (!activeSessionsRegistry) return;
   const marker = staleWorkingCardSweepMarker(larkAppId);

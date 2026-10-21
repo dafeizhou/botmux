@@ -145,20 +145,32 @@ describe('ClaudeTranscriptTurnEnd', () => {
 
 describe('staleProgramStatusVerdict', () => {
   const quiet = STALE_PROGRAM_STATUS_QUIET_MS;
+  const evidence = (over: Partial<Parameters<typeof staleProgramStatusVerdict>[0]> = {}) => ({
+    heldWorking: true,
+    programStatusQuietMs: quiet,
+    transcriptEndedForMs: quiet,
+    backgroundTasksRunning: 0,
+    ...over,
+  });
 
   it('only consults the screen once the transcript and OSC have both been quiet long enough', () => {
-    expect(staleProgramStatusVerdict({ heldWorking: true, programStatusQuietMs: quiet, transcriptEndedForMs: quiet }))
-      .toBe('check-screen');
-    expect(staleProgramStatusVerdict({ heldWorking: true, programStatusQuietMs: quiet - 1, transcriptEndedForMs: quiet }))
-      .toBe('wait');
-    expect(staleProgramStatusVerdict({ heldWorking: true, programStatusQuietMs: quiet, transcriptEndedForMs: quiet - 1 }))
-      .toBe('wait');
+    expect(staleProgramStatusVerdict(evidence())).toBe('check-screen');
+    expect(staleProgramStatusVerdict(evidence({ programStatusQuietMs: quiet - 1 }))).toBe('wait');
+    expect(staleProgramStatusVerdict(evidence({ transcriptEndedForMs: quiet - 1 }))).toBe('wait');
+  });
+
+  it('keeps waiting while background work of the ended turn is still running', () => {
+    // Claude Code holds `working` for a background Bash / Monitor / agent after
+    // the main turn ended: a real hold, not a lost terminal report.
+    expect(staleProgramStatusVerdict(evidence({
+      programStatusQuietMs: quiet * 60,
+      transcriptEndedForMs: quiet * 60,
+      backgroundTasksRunning: 1,
+    }))).toBe('wait');
   });
 
   it('stops when nothing is held or the transcript turn is still open', () => {
-    expect(staleProgramStatusVerdict({ heldWorking: false, programStatusQuietMs: quiet * 10, transcriptEndedForMs: quiet * 10 }))
-      .toBe('stop');
-    expect(staleProgramStatusVerdict({ heldWorking: true, programStatusQuietMs: quiet * 10, transcriptEndedForMs: undefined }))
-      .toBe('stop');
+    expect(staleProgramStatusVerdict(evidence({ heldWorking: false, backgroundTasksRunning: 2 }))).toBe('stop');
+    expect(staleProgramStatusVerdict(evidence({ transcriptEndedForMs: undefined }))).toBe('stop');
   });
 });

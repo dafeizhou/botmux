@@ -351,6 +351,15 @@ describe('staleWorkingCardIds', () => {
       listedCard('om_text', '🖥️ Claude · x — 工作中', { msg_type: 'text' }),
     ], opts)).toEqual(['om_orphan', 'om_orphan_en']);
   });
+
+  it('recognises this bot under every sender shape the message API uses', () => {
+    expect(staleWorkingCardIds([
+      listedCard('om_as_bot', '🖥️ Claude · x — 工作中', { sender: { id: 'app_test', id_type: 'app_id', sender_type: 'bot' } }),
+      listedCard('om_app_id_only', '🖥️ Claude · x — 工作中', { sender: { id: 'app_test', id_type: 'app_id' } }),
+      listedCard('om_other_bot', '🖥️ Claude · x — 工作中', { sender: { id: 'cli_other', id_type: 'app_id', sender_type: 'bot' } }),
+      listedCard('om_untyped', '🖥️ Claude · x — 工作中', { sender: { id: 'app_test' } }),
+    ], opts)).toEqual(['om_as_bot', 'om_app_id_only']);
+  });
 });
 
 describe('sweepStaleWorkingCards', () => {

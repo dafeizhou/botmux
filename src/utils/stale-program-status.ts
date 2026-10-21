@@ -6,8 +6,9 @@
  * is lost (or a child id never reports back), the session stays `working`
  * forever — prompt on screen, transcript long finished. The release here needs
  * every independent signal to agree: the transcript closed the turn with
- * nothing written since, OSC itself has been silent, and the screen shows the
- * idle prompt with no busy marker. The screen is only the last check.
+ * nothing written since and no background task of it still running, OSC
+ * itself has been silent, and the screen shows the idle prompt with no busy
+ * marker. The screen is only the last check.
  */
 import { isClaudeTurnTerminalEvent, type TranscriptEvent } from '../services/claude-transcript.js';
 
@@ -58,12 +59,18 @@ export interface StaleProgramStatusEvidence {
   programStatusQuietMs: number;
   /** Since the transcript closed the turn; undefined while it is open. */
   transcriptEndedForMs: number | undefined;
+  /** Background tasks the transcript shows launched and not yet stopped. */
+  backgroundTasksRunning: number;
 }
 
 /** `wait`: keep checking; `stop`: nothing to release; `check-screen`: every
  *  deterministic signal agrees — release if the screen shows the idle prompt. */
 export function staleProgramStatusVerdict(e: StaleProgramStatusEvidence): 'stop' | 'wait' | 'check-screen' {
   if (!e.heldWorking || e.transcriptEndedForMs === undefined) return 'stop';
+  // Claude Code keeps reporting `working` while background work it launched is
+  // still running after the main turn ended. That hold is real, not a lost
+  // terminal report; it ends with the tasks (and the card shows them).
+  if (e.backgroundTasksRunning > 0) return 'wait';
   if (e.transcriptEndedForMs < STALE_PROGRAM_STATUS_QUIET_MS
     || e.programStatusQuietMs < STALE_PROGRAM_STATUS_QUIET_MS) return 'wait';
   return 'check-screen';

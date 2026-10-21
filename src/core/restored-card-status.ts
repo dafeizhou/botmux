@@ -61,6 +61,16 @@ export function streamingCardTitleClaimsWork(title: string | undefined): boolean
   return workingStatusLabels().has(title.slice(sep + ' — '.length).trim());
 }
 
+/** The message was sent by this bot. Lark labels a bot sender `app` in message
+ *  lists, but other surfaces of the same API have said `bot`; accept either, or
+ *  an app_id-typed id (as deferred-topic-claim does). The fence that matters is
+ *  equality with this bot's own app id. */
+function isOwnAppSender(sender: Record<string, any> | undefined, larkAppId: string): boolean {
+  if (!sender || sender.id !== larkAppId) return false;
+  const idType = sender.id_type ?? sender.sender_id_type;
+  return sender.sender_type === 'app' || sender.sender_type === 'bot' || idType === 'app_id';
+}
+
 /** Streaming cards in a listed message window (Lark `im/v1/messages` items)
  *  that this bot posted before `postedBefore` and that still claim work while
  *  being no session's live card. Older builds left these behind: a type-ahead
@@ -73,7 +83,7 @@ export function staleWorkingCardIds(
   const ids: string[] = [];
   for (const m of messages as Array<Record<string, any> | null | undefined>) {
     if (!m || m.deleted === true || m.msg_type !== 'interactive') continue;
-    if (m.sender?.sender_type !== 'app' || m.sender?.id !== opts.larkAppId) continue;
+    if (!isOwnAppSender(m.sender, opts.larkAppId)) continue;
     const id = m.message_id;
     if (typeof id !== 'string' || !id || opts.liveCardIds.has(id)) continue;
     const createdAt = Number(m.create_time);
