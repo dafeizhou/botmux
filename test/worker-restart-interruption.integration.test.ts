@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -182,4 +182,83 @@ describe('worker restart interruption notice (real worker, fake Pi)', () => {
     expect(w.notices()).toHaveLength(0);
     expect(env.processInput(0)).not.toContain('重启');
   }, 60_000);
+});
+
+describe('worker restart interruption notice (real worker, fake Claude Code)', () => {
+  it('reads the Claude transcript at the bridge baseline and names the background task the old process killed', async () => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-restart-claude-'));
+    const workDir = join(root, 'work');
+    const dataDir = join(root, 'data');
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345681';
+    const projectDir = join(root, '.claude', 'projects', realpathSync(workDir).replace(/[^A-Za-z0-9-]/g, '-'));
+    mkdirSync(projectDir, { recursive: true });
+    // What Claude Code 2.1.305 left on 10-21: a background CI wait launched,
+    // the turn ended, then the process killed the task on its way out.
+    const ts = (s: string) => `2026-10-20T20:${s}.000Z`;
+    writeFileSync(join(projectDir, `${cliSessionId}.jsonl`), [
+      { type: 'user', uuid: 'p1', timestamp: ts('10:00'), message: { role: 'user', content: 'watch CI' } },
+      { type: 'assistant', uuid: 'a1', timestamp: ts('10:05'), message: { role: 'assistant', stop_reason: 'tool_use', content: [
+        { type: 'tool_use', id: 'call-1', name: 'Bash', input: { command: 'gh run watch 1', description: 'Wait for CI run 1 to complete', run_in_background: true } },
+      ] } },
+      { type: 'user', uuid: 'u1', timestamp: ts('10:05'), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: 'running' }] },
+        toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bqcj23cgb' } },
+      { type: 'assistant', uuid: 'a2', timestamp: ts('10:06'), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Waiting.' }] } },
+      { type: 'system', subtype: 'turn_duration', timestamp: ts('10:06') },
+      { type: 'queue-operation', operation: 'enqueue', timestamp: ts('42:58'), content:
+        '<task-notification>\n<task-id>bqcj23cgb</task-id>\n<status>killed</status>\n<summary>Background command "Wait for CI run 1 to complete" was stopped</summary>\n</task-notification>' },
+    ].map(row => `${JSON.stringify(row)}\n`).join(''));
+    const fakeClaude = join(root, 'fake-claude');
+    const crashFlag = join(root, 'crash');
+    writeFileSync(fakeClaude, `#!/usr/bin/env node
+import('node:fs').then(fs => {
+process.stdout.write('\u276f ');
+process.stdin.resume();
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(crashFlag)})) { fs.unlinkSync(${JSON.stringify(crashFlag)}); process.exit(1); }
+}, 20);
+});
+`);
+    chmodSync(fakeClaude, 0o755);
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-restart-claude', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test-only',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init', sessionId: 'sid-restart-claude', chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeClaude, cliSessionId,
+      backendType: 'pty', prompt: '', resume: true, larkAppId: 'app_test', larkAppSecret: 'test-only', locale: 'zh',
+    } satisfies DaemonToWorker);
+    await waitUntil(() => messages.some(msg => msg.type === 'user_notify'), logs, 45_000);
+    const notices = messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'user_notify' }> => msg.type === 'user_notify');
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain('1 个后台任务已停止');
+    expect(notices[0].message).toContain('「Wait for CI run 1 to complete」（后台命令 bqcj23cgb）');
+    // This new worker never wrote a turn, so the CLI is not handed the note.
+    expect(notices[0].message).toContain('明确让它接着做');
+    expect(notices[0].message).not.toContain('上一轮');
+
+    // The CLI now crashes inside this worker. The worker saw it end just now,
+    // long after that stop, so the same transcript no longer reads as an exit
+    // kill: no second notice.
+    const readies = () => messages.filter(msg => msg.type === 'prompt_ready').length;
+    await waitUntil(() => readies() > 0, logs);
+    const before = readies();
+    writeFileSync(crashFlag, '1');
+    await waitUntil(() => messages.some(msg => msg.type === 'claude_exit'), logs);
+    child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+    await waitUntil(() => readies() > before, logs, 45_000);
+    await new Promise(done => setTimeout(done, 800));
+    expect(messages.filter(msg => msg.type === 'user_notify')).toHaveLength(1);
+  }, 90_000);
 });

@@ -7,6 +7,7 @@ import {
   RESTART_TASK_MAX_AGE_MS,
   claudeInterruptedWork,
   hasInterruptedWork,
+  mergeInterruptedWork,
   prefixRestartNote,
   restartInterruptionNote,
   restartInterruptionNotice,
@@ -126,6 +127,24 @@ describe('claudeInterruptedWork — background tasks', () => {
     expect(claudeInterruptedWork(events, Date.parse(at('11:00:00'))).tasks).toEqual([]);
   });
 
+  it('with botmux\'s record of when the process ended, a stop made long before it is not an exit kill', () => {
+    // Idle session: the user stops the monitor from the TUI's task dialog at
+    // 10:01; Claude Code wakes no one, so that stop is the last record. The CLI
+    // dies at 16:00.
+    const events = [
+      ...monitorLaunch(1, '10:00:00', 'm1', 'watch CI', 0),
+      ...endTurn('a-end', '10:00:05'),
+      enqueue('10:01:00', notice(['m1'], 'killed', 'Monitor "watch CI" stopped')),
+    ];
+    const restartAt = Date.parse(at('16:00:20'));
+    expect(claudeInterruptedWork(events, restartAt, { processEndedAtMs: Date.parse(at('16:00:00')) }).tasks).toEqual([]);
+    // The transcript alone cannot tell (new worker, no record): reported.
+    expect(claudeInterruptedWork(events, restartAt).tasks.map(task => task.taskId)).toEqual(['m1']);
+    // A real exit kill is a few seconds before the observed end (12–22 s on 10-21).
+    expect(claudeInterruptedWork(events, Date.parse(at('10:01:30')), { processEndedAtMs: Date.parse(at('10:01:22')) })
+      .tasks.map(task => task.taskId)).toEqual(['m1']);
+  });
+
   it('a task still running with no stop record at all is reported (process killed without writing one)', () => {
     const events = [...bashLaunch(1, '10:00:00', 'b1', 'watch deploy'), ...endTurn('a-end', '10:00:05')];
     expect(claudeInterruptedWork(events, Date.parse(at('10:30:00'))).tasks.map(task => task.taskId)).toEqual(['b1']);
@@ -199,6 +218,18 @@ describe('claudeInterruptedWork — the main turn', () => {
       { ...toolUse('side', '11:30:00', 'side-1', 'Bash', { command: 'x' }), isSidechain: true } as TranscriptEvent,
     ];
     expect(claudeInterruptedWork(events, BEFORE).turnOpen).toBe(false);
+  });
+});
+
+describe('mergeInterruptedWork', () => {
+  it('keeps an undelivered earlier result: the dead resumed process\'s own records settled its tasks', () => {
+    const earlier = { turnOpen: true, tasks: [{ taskId: 'b1', kind: 'shell' as const, description: 'poll CI' }] };
+    const later = { turnOpen: false, tasks: [{ taskId: 'b2', kind: 'monitor' as const }] };
+    expect(mergeInterruptedWork(earlier, later)).toEqual({ turnOpen: true, tasks: [earlier.tasks[0], later.tasks[0]] });
+    expect(mergeInterruptedWork(undefined, later)).toBe(later);
+    // The same task seen again keeps the newer record, once.
+    const again = { turnOpen: false, tasks: [{ taskId: 'b1', kind: 'shell' as const }] };
+    expect(mergeInterruptedWork(earlier, again).tasks).toEqual([{ taskId: 'b1', kind: 'shell' }]);
   });
 });
 

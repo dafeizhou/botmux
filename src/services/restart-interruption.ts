@@ -46,9 +46,18 @@ export const RESTART_TASK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** How close to the old process's last record a `killed` stop must be to count
  *  as the process killing its tasks on the way out. Claude Code writes those
  *  stops, and at most a `dequeue` of them, within a second of dying (0.2 s in
- *  a real tmux server loss); a stop made from the TUI's task dialog is
- *  followed by the session carrying on. */
+ *  a real tmux server loss). This only rules out a TUI-dialog stop the session
+ *  carried on past: Claude Code does not wake the model for such a stop, so on
+ *  an idle session it is the last record just like an exit kill
+ *  (see {@link EXIT_KILL_MAX_LAG_MS}). */
 export const EXIT_KILL_WINDOW_MS = 5_000;
+
+/** With botmux's record of when the old process ended (the worker saw it exit
+ *  or stopped it), a `killed` stop must also be at most this long before that
+ *  moment. Bounds the idle-session TUI stop above: one made hours before a
+ *  crash is not reported. Generous because a tmux pane's death is noticed by
+ *  polling (12–22 s after the kills on 10-21). */
+export const EXIT_KILL_MAX_LAG_MS = 30 * 60_000;
 
 export interface InterruptedBackgroundTask {
   taskId: string;
@@ -124,14 +133,21 @@ interface TrackedTask extends InterruptedBackgroundTask {
  *
  * Background tasks: launches read from `toolUseResult` (Agent / Bash /
  * Monitor, see {@link backgroundTaskLaunches}) plus the legacy Agent
- * dispatch/ack pair, minus every recorded stop. A `killed` stop written within
- * {@link EXIT_KILL_WINDOW_MS} of the last record the old process wrote is the
- * process killing its tasks on the way out, so those tasks count as
- * interrupted; one the session carried on past was a stop made while it lived
- * (TUI dialog). A non-persistent Monitor whose own deadline passed, and
- * launches older than {@link RESTART_TASK_MAX_AGE_MS}, are not reported.
+ * dispatch/ack pair, minus every recorded stop. A `killed` stop counts as the
+ * process killing the task on its way out — so the task was interrupted — when
+ * it is within {@link EXIT_KILL_WINDOW_MS} of the last record the old process
+ * wrote and, given `processEndedAtMs`, within {@link EXIT_KILL_MAX_LAG_MS}
+ * before that end. Without `processEndedAtMs` (a new worker resuming after a
+ * daemon restart or a suspend) a TUI-dialog stop on an idle session cannot be
+ * told apart and is reported too. A non-persistent Monitor whose own deadline
+ * passed, and launches older than {@link RESTART_TASK_MAX_AGE_MS}, are not
+ * reported.
  */
-export function claudeInterruptedWork(events: readonly TranscriptEvent[], beforeMs: number): InterruptedWork {
+export function claudeInterruptedWork(
+  events: readonly TranscriptEvent[],
+  beforeMs: number,
+  opts: { processEndedAtMs?: number } = {},
+): InterruptedWork {
   let turnOpen = false;
   const toolUses = new Map<string, string | undefined>();
   const legacyAwaitingAck = new Map<string, string | undefined>();
@@ -219,12 +235,26 @@ export function claudeInterruptedWork(events: readonly TranscriptEvent[], before
     (task.expiresAtMs === undefined || task.expiresAtMs > beforeMs)
     && (task.atMs === undefined || beforeMs - task.atMs <= RESTART_TASK_MAX_AGE_MS);
   const killedOnExit = [...killed.values()]
-    .filter(k => lastRecordAtMs - k.atMs <= EXIT_KILL_WINDOW_MS)
+    .filter(k => lastRecordAtMs - k.atMs <= EXIT_KILL_WINDOW_MS
+      && (opts.processEndedAtMs === undefined || opts.processEndedAtMs - k.atMs <= EXIT_KILL_MAX_LAG_MS))
     .map(k => k.task);
   const tasks = [...live.values(), ...killedOnExit]
     .filter(reportable)
     .map(({ taskId, kind, description }) => ({ taskId, kind, ...(description ? { description } : {}) }));
   return { turnOpen, tasks };
+}
+
+/** `later` (the newest scan) with an `earlier` result that was never handed
+ *  over still folded in: a resumed process that died before its first prompt
+ *  wrote resume records that settle the old tasks, so the newer scan alone
+ *  would forget them. */
+export function mergeInterruptedWork(earlier: InterruptedWork | undefined, later: InterruptedWork): InterruptedWork {
+  if (!earlier) return later;
+  const known = new Set(later.tasks.map(task => task.taskId));
+  return {
+    turnOpen: later.turnOpen || earlier.turnOpen,
+    tasks: [...earlier.tasks.filter(task => !known.has(task.taskId)), ...later.tasks],
+  };
 }
 
 /**

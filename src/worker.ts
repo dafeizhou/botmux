@@ -81,6 +81,7 @@ import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgeP
 import {
   claudeInterruptedWork,
   hasInterruptedWork,
+  mergeInterruptedWork,
   prefixRestartNote,
   restartInterruptionNote,
   restartInterruptionNotice,
@@ -5802,14 +5803,17 @@ let pendingRestartInterruption: InterruptedWork | undefined;
 /** The last input written to the CLI: the turn a standalone restart note
  *  continues when nothing else is queued. */
 let lastWrittenCliInput: PendingCliInput | undefined;
+/** When this worker saw its previous CLI process end (exit callback, or its
+ *  own teardown). Lets the scan tell the process's exit kills from a task
+ *  stopped long before it (EXIT_KILL_MAX_LAG_MS). Unset in a new worker. */
+let previousCliEndedAtMs: number | undefined;
 
 /** Read the transcript tail the previous CLI process wrote — Claude Code's
  *  JSONL, or a structured CLI's (Pi, Codex, …) through its bridge drainer —
  *  and keep what it left unfinished. Records stamped at/after this launch are
  *  the resumed process's and are ignored. A result not yet delivered (the
- *  resumed process died before its prompt) is merged, not replaced: the new
- *  process's resume records settle the old tasks, so a second scan alone
- *  would forget them. */
+ *  resumed process died before its prompt) is merged in, not replaced
+ *  (mergeInterruptedWork). */
 function scanRestartInterruption(path: string, family: 'claude' | 'structured'): void {
   const beforeMs = restartInterruptionScanBeforeMs;
   if (beforeMs === undefined) return;
@@ -5818,7 +5822,9 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
   try {
     const from = transcriptTailOffset(path);
     if (family === 'claude') {
-      work = claudeInterruptedWork(drainTranscript(path, from).events, beforeMs);
+      work = claudeInterruptedWork(drainTranscript(path, from).events, beforeMs, {
+        ...(previousCliEndedAtMs !== undefined ? { processEndedAtMs: previousCliEndedAtMs } : {}),
+      });
     } else {
       const spec = bridgeSpecFor(lastInitConfig?.cliId);
       // Cursor's transcript has no per-record timestamps: nothing in it can be
@@ -5831,14 +5837,7 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
     log(`Restart interruption scan failed for ${path}: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  const previous = pendingRestartInterruption;
-  if (previous) {
-    const known = new Set(work.tasks.map(task => task.taskId));
-    work = {
-      turnOpen: work.turnOpen || previous.turnOpen,
-      tasks: [...previous.tasks.filter(task => !known.has(task.taskId)), ...work.tasks],
-    };
-  }
+  work = mergeInterruptedWork(pendingRestartInterruption, work);
   if (!hasInterruptedWork(work)) return;
   pendingRestartInterruption = work;
   log(
@@ -22573,6 +22572,7 @@ async function spawnCli(
     // for that deferred park.
     lastCliExitCode = code;
     lastCliExitSignal = signal;
+    previousCliEndedAtMs = Date.now();
     const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
@@ -22886,6 +22886,7 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  if (backend) previousCliEndedAtMs = Date.now();
   inputDeliveryQuarantine = null;
   postTerminalInputFence = null;
   currentCliCredentialIsolated = false;
