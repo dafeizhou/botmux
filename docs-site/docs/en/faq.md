@@ -94,6 +94,8 @@ When the CLI process exits unexpectedly (a crash, the tmux server going away, �
 
 If so, the resumed CLI first receives a short note (it was restarted, which background tasks were interrupted, check them and continue), and the thread gets one notice. A cold resume after a suspend or a daemon restart is checked the same way, with the note placed in front of the next message the CLI receives (a CLI that takes its first message as a launch argument, such as Pi, only gets the thread notice). Only the transcript is read, never the screen; this covers Claude Code and CLIs with structured transcripts such as Pi and Codex (for those, only the turn). Nothing is posted when nothing was interrupted.
 
+Messages received before a restart but not yet handed to the CLI are not dropped either: a first message passed to the CLI as a launch argument that the CLI exited before starting is typed in again after the restart, and messages still queued when the daemon restarts are delivered by the session's next worker. Ones more than 24 hours old are reported in the thread as not delivered instead.
+
 Also, a session whose main turn has ended while background tasks keep running (the card shows "⏳ Main turn ended · background tasks running (N)") is not suspended by the live-session cap or the idle timeout: suspending would kill those tasks, and a cold resume cannot bring them back.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?

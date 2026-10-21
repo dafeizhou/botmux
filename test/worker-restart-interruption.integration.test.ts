@@ -53,6 +53,7 @@ function setup(name: string, opts: { recordTurns: boolean; history?: object[] })
   })).map(line => `${line}\n`).join(''));
   const inputLog = join(root, 'input.log');
   const crashFlag = join(root, 'crash');
+  const busyFlag = join(root, 'busy');
   const fakePi = join(root, 'fake-pi');
   // Records every byte typed into it (one `--- start` line per process). With
   // recordTurns, a submitted line is written as Pi writes a turn cut off mid
@@ -80,6 +81,7 @@ process.stdin.on('data', chunk => {
 });
 setInterval(() => {
   if (fs.existsSync(${JSON.stringify(crashFlag)})) { fs.unlinkSync(${JSON.stringify(crashFlag)}); process.exit(1); }
+  if (fs.existsSync(${JSON.stringify(busyFlag)})) process.stdout.write('Working...\\n');
 }, 20);
 });
 `);
@@ -89,7 +91,7 @@ setInterval(() => {
     const processes = existsSync(inputLog) ? readFileSync(inputLog, 'utf8').split('--- start\n').slice(1) : [];
     return processes[n];
   };
-  return { dataDir, cliSessionId, transcript, crashFlag, fakePi, processInput };
+  return { dataDir, cliSessionId, transcript, crashFlag, busyFlag, fakePi, processInput };
 }
 
 function startWorker(env: ReturnType<typeof setup>, init: Partial<Extract<DaemonToWorker, { type: 'init' }>> = {}) {
@@ -166,6 +168,55 @@ describe('worker restart interruption notice (real worker, fake Pi)', () => {
     expect(w.notices()).toHaveLength(2);
     expect(w.notices()[1]).toMatchObject({ turnId: 'om_turn2' });
     expect(w.notices()[1].message).toContain('已提醒');
+  }, 60_000);
+
+  it('re-delivers an argv-baked first prompt the CLI died before starting (#1931 / #1841 / #2016 on 10-21)', async () => {
+    // A message cold-starts the session; Pi takes it as a launch argument. The
+    // pane is gone before Pi shows any sign of running it.
+    const env = setup('restart-argv-prompt', { recordTurns: false });
+    const w = startWorker(env, { resume: true, prompt: 'review PR 1931', turnId: 'om_cold' });
+    await waitUntil(() => env.processInput(0) !== undefined && w.logs.join('').includes('Argv-baked first prompt'), w.logs);
+    await crashAndRestart(env, w);
+
+    await waitUntil(() => !!env.processInput(1)?.includes(PASTE_END), w.logs);
+    expect(env.processInput(1)).toContain('review PR 1931');
+    // Delivered, so nothing to report.
+    expect(w.notices()).toHaveLength(0);
+  }, 60_000);
+
+  it('a message still queued when the daemon stops the worker reaches the next worker\'s CLI', async () => {
+    const env = setup('restart-unsent', { recordTurns: false });
+    writeFileSync(env.busyFlag, '1');
+    const first = startWorker(env, { resume: true });
+    await waitUntil(() => env.processInput(0) !== undefined, first.logs);
+    // The CLI never reaches its prompt, so the message waits in the worker.
+    child!.send({ type: 'message', content: 'check the deploy', turnId: 'om_queued' } satisfies DaemonToWorker);
+    await new Promise(done => setTimeout(done, 500));
+    expect(env.processInput(0)).not.toContain('check the deploy');
+    const exited = new Promise<void>(done => child!.once('exit', () => done()));
+    child!.kill('SIGTERM');
+    await exited;
+    expect(existsSync(join(env.dataDir, 'turn-marks', 'sid-restart-note.unsent.json'))).toBe(true);
+
+    rmSync(env.busyFlag, { force: true });
+    const second = startWorker(env, { resume: true });
+    await waitUntil(() => !!env.processInput(1)?.includes(PASTE_END), second.logs);
+    expect(env.processInput(1)).toContain('check the deploy');
+    expect(existsSync(join(env.dataDir, 'turn-marks', 'sid-restart-note.unsent.json'))).toBe(false);
+  }, 60_000);
+
+  it('reports a message saved too long ago as not delivered instead of typing it in', async () => {
+    const env = setup('restart-unsent-expired', { recordTurns: false });
+    mkdirSync(join(env.dataDir, 'turn-marks'), { recursive: true });
+    writeFileSync(join(env.dataDir, 'turn-marks', 'sid-restart-note.unsent.json'), JSON.stringify({
+      version: 1, savedAtMs: Date.now() - 25 * 60 * 60 * 1000, inputs: [{ content: 'stale request', turnId: 'om_stale' }],
+    }));
+    const w = startWorker(env, { resume: true });
+    await waitUntil(() => w.notices().length > 0 && w.messages.some(msg => msg.type === 'prompt_ready'), w.logs);
+    expect(w.notices()[0]).toMatchObject({ turnId: 'om_stale' });
+    expect(w.notices()[0].message).toContain('没能送进 CLI');
+    await new Promise(done => setTimeout(done, 800));
+    expect(env.processInput(0)).not.toContain('stale request');
   }, 60_000);
 
   it('a restart after a finished turn says nothing', async () => {

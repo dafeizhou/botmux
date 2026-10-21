@@ -1321,6 +1321,7 @@ export const messages: Record<string, string> = {
   'worker.restart_interrupted.kind.agent': '后台子代理',
   'worker.restart_interrupted.list_separator': '、',
   'worker.restart_interrupted.more_tasks': ' 等另外 {count} 个',
+  'worker.unsent_inputs_expired': '⚠️ 会话重启前收到的 {count} 条消息没能送进 CLI，且已超过 24 小时，不再自动补投。如仍需要，请重新发送。',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.silent_turn_receipt': '🪧 本轮已处理完毕：我判定这条消息无需回复（自动回执）。如需我必须回话，请再 @ 我并明确要求答复。',
   'worker.turn_terminal_receipt.completed': '✓ 本轮已结束 · 等待输入',
