@@ -15,6 +15,7 @@ import {
   restartNoteMayPrefix,
   structuredTurnOpen,
   transcriptTailOffset,
+  withoutReportedTasks,
 } from '../src/services/restart-interruption.js';
 import { setDefaultLocale } from '../src/i18n/index.js';
 
@@ -230,6 +231,14 @@ describe('mergeInterruptedWork', () => {
     // The same task seen again keeps the newer record, once.
     const again = { turnOpen: false, tasks: [{ taskId: 'b1', kind: 'shell' as const }] };
     expect(mergeInterruptedWork(earlier, again).tasks).toEqual([{ taskId: 'b1', kind: 'shell' }]);
+  });
+});
+
+describe('withoutReportedTasks', () => {
+  it('drops tasks this worker already reported and keeps the turn as is', () => {
+    const work = { turnOpen: true, tasks: [{ taskId: 'b1', kind: 'shell' as const }, { taskId: 'b2', kind: 'monitor' as const }] };
+    expect(withoutReportedTasks(work, new Set(['b1']))).toEqual({ turnOpen: true, tasks: [{ taskId: 'b2', kind: 'monitor' }] });
+    expect(hasInterruptedWork(withoutReportedTasks({ turnOpen: false, tasks: [work.tasks[0]] }, new Set(['b1'])))).toBe(false);
   });
 });
 

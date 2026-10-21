@@ -89,6 +89,7 @@ import {
   restartNoteMayPrefix,
   structuredTurnOpen,
   transcriptTailOffset,
+  withoutReportedTasks,
   type InterruptedWork,
 } from './services/restart-interruption.js';
 import { saveUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
@@ -5808,6 +5809,8 @@ let lastWrittenCliInput: PendingCliInput | undefined;
  *  own teardown). Lets the scan tell the process's exit kills from a task
  *  stopped long before it (EXIT_KILL_MAX_LAG_MS). Unset in a new worker. */
 let previousCliEndedAtMs: number | undefined;
+/** Background tasks this worker already reported as interrupted. */
+const reportedInterruptedTaskIds = new Set<string>();
 
 /** Read the transcript tail the previous CLI process wrote — Claude Code's
  *  JSONL, or a structured CLI's (Pi, Codex, …) through its bridge drainer —
@@ -5826,6 +5829,9 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
       work = claudeInterruptedWork(drainTranscript(path, from).events, beforeMs, {
         ...(previousCliEndedAtMs !== undefined ? { processEndedAtMs: previousCliEndedAtMs } : {}),
       });
+      // Belongs to the process this scan was about; a later one that ends
+      // without being seen must not borrow it.
+      previousCliEndedAtMs = undefined;
     } else {
       const spec = bridgeSpecFor(lastInitConfig?.cliId);
       // Cursor's transcript has no per-record timestamps: nothing in it can be
@@ -5838,7 +5844,7 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
     log(`Restart interruption scan failed for ${path}: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  work = mergeInterruptedWork(pendingRestartInterruption, work);
+  work = withoutReportedTasks(mergeInterruptedWork(pendingRestartInterruption, work), reportedInterruptedTaskIds);
   if (!hasInterruptedWork(work)) return;
   pendingRestartInterruption = work;
   log(
@@ -5860,6 +5866,7 @@ function deliverRestartInterruptionNote(): void {
   const work = pendingRestartInterruption;
   if (!work) return;
   pendingRestartInterruption = undefined;
+  for (const task of work.tasks) reportedInterruptedTaskIds.add(task.taskId);
   const note = restartInterruptionNote(work);
   let delivered = false;
   let noticeTurnId: string | undefined;

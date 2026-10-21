@@ -257,6 +257,13 @@ export function mergeInterruptedWork(earlier: InterruptedWork | undefined, later
   };
 }
 
+/** `work` without the background tasks already reported by this worker: a
+ *  crash loop resumes the same transcript again and again, and one task needs
+ *  one mention, not one per restart. */
+export function withoutReportedTasks(work: InterruptedWork, reported: ReadonlySet<string>): InterruptedWork {
+  return { turnOpen: work.turnOpen, tasks: work.tasks.filter(task => !reported.has(task.taskId)) };
+}
+
 /**
  * Whether a structured-transcript CLI (Pi, Codex, Grok, …) was mid-turn when
  * its process ended, from the bridge events its drainer produced: a prompt or
