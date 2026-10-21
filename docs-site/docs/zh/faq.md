@@ -85,6 +85,17 @@ botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速�
 
 装了 **tmux** 就不会——tmux 是默认后端，CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。⚠️ 没装 tmux **不会自动降级 pty**，而是硬拦截弹卡让你装 tmux；只有显式 `BACKEND_TYPE=pty`（或 per-bot `backendType:"pty"`）才用 pty，且 pty 会话**不跨 daemon 重启存活**、重启会重载。
 
+## CLI 中途被重启，进行中的工作会怎样？
+
+CLI 进程意外退出（崩溃、tmux server 掉线等）后，botmux 会在同一 worker 内用原上下文重新拉起它，并读旧进程留下的 transcript，看有没有被打断的工作：
+
+- **上一轮还没做完**（例如复审跑到一半）；
+- **后台任务随旧进程一起被终止**（Claude Code 的 `run_in_background` 命令、Monitor、后台子代理）。
+
+有的话，恢复后的 CLI 会先收到一条简短说明（重启过、哪些后台任务中断了、请核对后继续），话题里也会出现一次提示。挂起或 daemon 重启后冷启动时同样检查，说明放在下一条消息前面一起交给 CLI（Pi 这类把首条消息放进启动参数的 CLI 无法前置，只发话题提示）。判断只看 transcript，不读屏幕；目前覆盖 Claude Code 和 Pi、Codex 等结构化 transcript 的 CLI（后者只判断回合）。没有被打断的工作就什么都不发。
+
+另外，主回合已结束、但还有后台任务在跑的会话（卡片显示「⏳ 主回合已结束 · 后台子任务运行中（N）」）不会被活跃会话上限或空闲超时自动挂起：挂起会杀掉这些任务，冷启动也没法让它们回来。
+
 ## 会话不关会一直跑吗？有自动回收吗？
 
 会一直跑，**目前无空闲 TTL 自动回收**。用 `/close`、Dashboard 批量关闭、或 `botmux delete stopped`/`all` 清理。

@@ -85,6 +85,17 @@ See [Multi-bot Collaboration](/en/multi-bot) for details.
 
 With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
 
+## What happens to work in progress when the CLI is restarted mid-way?
+
+When the CLI process exits unexpectedly (a crash, the tmux server going away, …), botmux relaunches it in the same worker with its previous context and reads the transcript the old process left behind to see whether work was cut off:
+
+- **the previous turn had not finished** (say, a review half-way through);
+- **background tasks were terminated with the old process** (Claude Code `run_in_background` commands, Monitors, background agents).
+
+If so, the resumed CLI first receives a short note (it was restarted, which background tasks were interrupted, check them and continue), and the thread gets one notice. A cold resume after a suspend or a daemon restart is checked the same way, with the note placed in front of the next message the CLI receives (a CLI that takes its first message as a launch argument, such as Pi, only gets the thread notice). Only the transcript is read, never the screen; this covers Claude Code and CLIs with structured transcripts such as Pi and Codex (for those, only the turn). Nothing is posted when nothing was interrupted.
+
+Also, a session whose main turn has ended while background tasks keep running (the card shows "⏳ Main turn ended · background tasks running (N)") is not suspended by the live-session cap or the idle timeout: suspending would kill those tasks, and a cold resume cannot bring them back.
+
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 
 It keeps running, and there is **currently no idle-TTL automatic reclamation**. Use `/close`, batch-close via the Dashboard, or `botmux delete stopped`/`all` to clean up.
