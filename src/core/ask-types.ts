@@ -67,8 +67,11 @@ export type AskResult =
   | {
       kind: 'invalidated';
       reason: string;
-      /** Delivery never completed; do not describe this as a missing answer. */
-      failureCode?: 'card_delivery_failed';
+      /** card_delivery_failed: delivery never completed; do not describe this as
+       *  a missing answer. claimant_gone / answer_undelivered: the hook never
+       *  re-attached, so the asking CLI is no longer waiting (the latter: an
+       *  answer had been given but could not reach it). */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
       selected: null;
       by: null;
       comment: null;

@@ -281,6 +281,25 @@ describe('buildAskCard', () => {
     expect(text).toContain('超时');
   });
 
+  it.each([
+    ['claimant_gone', '这张卡不再接收回答'],
+    ['answer_undelivered', '这个回答没有送进会话'],
+  ] as const)('settled 态（invalidated:%s）：说明 CLI 已不在等待，而不是贴内部 reason', (failureCode, expected) => {
+    const text = buildAskCard(makePending(), {
+      kind: 'invalidated',
+      reason: 'internal reason text',
+      failureCode,
+      selected: null,
+      by: null,
+      comment: null,
+      timedOut: false,
+    });
+    expect(text).toContain('已失效');
+    expect(text).toContain(expected);
+    expect(text).not.toContain('internal reason text');
+    expect(text).not.toContain('ask_submit');
+  });
+
   it('长问题正文（>512 字符）完整渲染，不附加截断标记', () => {
     // 回归：ask 卡片曾对每个 q.prompt 做 512 字符截断（无飞书硬限制依据），
     // 审批人会在信息不全的情况下点按钮。现在问题正文必须完整渲染。

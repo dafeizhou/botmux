@@ -764,7 +764,12 @@ function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): stri
   if (result.kind === 'timedOut') {
     return `**${t('card.ask.timed_out', undefined, locale)}**`;
   }
-  return `**${t('card.ask.invalidated', undefined, locale)}**\n${escapeMd(result.reason)}`;
+  const detail = result.failureCode === 'claimant_gone'
+    ? t('card.ask.invalidated_claimant_gone', undefined, locale)
+    : result.failureCode === 'answer_undelivered'
+      ? t('card.ask.invalidated_answer_undelivered', undefined, locale)
+      : escapeMd(result.reason);
+  return `**${t('card.ask.invalidated', undefined, locale)}**\n${detail}`;
 }
 
 function templateForResult(result: AskResult): string {
