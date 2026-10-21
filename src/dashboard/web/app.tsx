@@ -220,6 +220,8 @@ const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
 let pinnedPluginNavItems: NavItem[] = [];
 
 let isAuthed = true;
+/** loadAuthState() 跑完（无论成败）才置位；在此之前 isAuthed 只是默认值。 */
+let authStateLoaded = false;
 let publicReadOnly = false;
 let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
@@ -1509,10 +1511,11 @@ function DashboardShell(): React.JSX.Element {
   // 只有页面清单可能变化时才换：开关面板、切语言、登录态、置顶插件、宿主终端权限。
   const paletteContext = useMemo<PaletteShellContext>(() => ({
     pages: palette.open ? paletteNavPages() : [],
+    manageDataReady: authStateLoaded && isAuthed,
     setLocale,
     openCreateSession: requestOpenCreateSession,
     openCreateBot: openCreateBotFromPalette,
-  }), [palette.open, ui.locale, isAuthed, pinnedPluginNavItems, ui.hostTerminal]);
+  }), [palette.open, ui.locale, isAuthed, authStateLoaded, pinnedPluginNavItems, ui.hostTerminal]);
   if (workbenchSurface) {
     return (
       <>
@@ -1773,6 +1776,7 @@ async function loadAuthState(): Promise<void> {
     }
   } catch { /* keep defaults */ }
   await capabilitiesProbe;
+  authStateLoaded = true;
 }
 
 async function loadPinnedPluginNavItems(): Promise<void> {

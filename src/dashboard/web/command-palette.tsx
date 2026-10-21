@@ -6,7 +6,7 @@ import type { ReactNode } from 'react';
 import { ModalDialog } from './modal-dialog.js';
 import { Html } from './dashboard-components.js';
 import { useDashboardLocale, useDashboardStore } from './react-hooks.js';
-import { botAvatarHtml, t, ui } from './ui.js';
+import { botAvatarHtml, nameMapsVersion, t, ui } from './ui.js';
 import type { SkillRow } from './skills/types.js';
 import {
   PALETTE_SCOPES,
@@ -19,6 +19,7 @@ import {
   type PaletteAction,
   type PaletteGroup,
   type PaletteItem,
+  type PaletteKind,
   type PaletteRow,
   type PaletteScope,
   type TextRange,
@@ -74,6 +75,11 @@ function loadRemote(): Promise<RemoteSnapshot> {
     return remoteCache;
   })().finally(() => { remoteInFlight = null; });
   return remoteInFlight;
+}
+
+export function __testOnly_resetPaletteRemoteCache(): void {
+  remoteCache = { skills: null, agents: null, fetchedAt: 0 };
+  remoteInFlight = null;
 }
 
 function useRemoteSources(open: boolean, enabled: boolean): { remote: RemoteSnapshot; loading: boolean } {
@@ -162,6 +168,12 @@ function Highlighted(props: { text: string; ranges: readonly TextRange[] }): Rea
   );
 }
 
+function moreRowLabel(row: Extract<PaletteRow, { type: 'more' }>): string {
+  return row.scope
+    ? t('palette.more', { count: row.count, scope: t(SCOPE_LABEL_KEYS[row.scope]) })
+    : t('palette.moreExpand', { count: row.count });
+}
+
 function rowKey(row: PaletteRow): string {
   return row.type === 'item' ? row.item.key : `more:${row.kind}`;
 }
@@ -205,13 +217,16 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   const [scope, setScope] = useState<PaletteScope>('all');
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [recentKeys, setRecentKeys] = useState<string[]>(() => readRecentKeys(storage()));
+  const [expandedKinds, setExpandedKinds] = useState<ReadonlySet<PaletteKind>>(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const baseId = useId();
   const listId = `${baseId}-list`;
   const optionId = (index: number) => `${baseId}-opt-${index}`;
-  const { remote, loading } = useRemoteSources(open, authed);
+  const { remote, loading } = useRemoteSources(open, authed && context.manageDataReady);
+  // bot / 群名映射晚到（冷启动时 /api/groups 还没回来）时，按行缓存的会话条目要跟着失效。
+  const namesVersion = nameMapsVersion();
 
   // Skill / Agent 是管理页，未登录（含公开只读访客）不出这两个分类。
   const scopes = useMemo(
@@ -223,14 +238,14 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   const sessionCacheRef = useRef<{ key: string; now: number; items: WeakMap<object, PaletteItem> } | null>(null);
   const sessionItems = useMemo(() => {
     if (!open) return [];
-    const cacheKey = `${locale}:${ui.workbenchAuthed}`;
+    const cacheKey = `${locale}:${ui.workbenchAuthed}:${namesVersion}`;
     if (sessionCacheRef.current?.key !== cacheKey) {
       sessionCacheRef.current = { key: cacheKey, now: Date.now(), items: new WeakMap() };
     }
     const cache = sessionCacheRef.current;
     return buildSessionItems(snapshot.sessions.values(), cache.now, cache.items);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- store 原地更新 Map，version 才是变化信号
-  }, [open, snapshot.version, locale, authed]);
+  }, [open, snapshot.version, locale, authed, namesVersion]);
   const remoteItems = useMemo(() => (open && authed ? [
     ...buildSkillItems(remote.skills ?? []),
     ...buildAgentItems(remote.agents?.agents ?? [], remote.agents?.links ?? {}),
@@ -241,7 +256,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
     ...buildPreferenceItems(context),
     ...buildBotItems(),
     ...buildPageItems(context.pages),
-  ] : []), [authed, context, locale, open, ui.theme]);
+  ] : []), [authed, context, locale, namesVersion, open, ui.theme]);
   const items = useMemo(() => [...sessionItems, ...remoteItems, ...localItems], [localItems, remoteItems, sessionItems]);
   const pageIcons = useMemo(
     () => new Map(context.pages.filter(page => page.icon).map(page => [page.id, page.icon])),
@@ -249,8 +264,8 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   );
 
   const result = useMemo(
-    () => searchPalette({ items, query: deferredQuery, scope, recentKeys }),
-    [deferredQuery, items, recentKeys, scope],
+    () => searchPalette({ items, query: deferredQuery, scope, recentKeys, expandedKinds }),
+    [deferredQuery, expandedKinds, items, recentKeys, scope],
   );
   const { rows, groups, counts } = result;
   const foundIndex = activeKey ? rows.findIndex(row => rowKey(row) === activeKey) : -1;
@@ -260,6 +275,20 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
 
   // 查询或分类变了，选中回到第一条（不沿用旧 key：旧条目可能恰好还在、却已不是最佳匹配）。
   useEffect(() => { setActiveKey(null); }, [deferredQuery, scope]);
+
+  // Esc 在 window 捕获阶段拦：它先于任何 document 级捕获监听（Skill 库多选态、排程群选择器
+  // 都在那里吞 Escape），否则一次 Esc 关掉的是面板底下的浮层，面板反而还开着。
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.isComposing || event.keyCode === 229) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [onClose, open]);
 
   useLayoutEffect(() => {
     const list = listRef.current;
@@ -305,7 +334,18 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   const choose = (row: PaletteRow | undefined, options: { alternate?: boolean; newTab?: boolean } = {}) => {
     if (!row) return;
     if (row.type === 'more') {
-      changeScope(row.scope);
+      if (row.scope) {
+        changeScope(row.scope);
+        return;
+      }
+      // 没有分类 tab 的组原地展开；「查看全部」那一行的位置正好换成该组第一条原先被截掉的条目，
+      // 选中它，键盘接着往下走。
+      const expanded = new Set(expandedKinds).add(row.kind);
+      setExpandedKinds(expanded);
+      const next = searchPalette({ items, query: deferredQuery, scope, recentKeys, expandedKinds: expanded });
+      const replacement = next.rows[rows.indexOf(row)];
+      setActiveKey(replacement ? rowKey(replacement) : null);
+      inputRef.current?.focus();
       return;
     }
     const action = options.alternate ? row.item.secondary ?? row.item.primary : row.item.primary;
@@ -337,10 +377,6 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
     } else if (event.key === 'Backspace' && query === '' && scope !== 'all') {
       event.preventDefault();
       setScope('all');
-    } else if (event.key === 'Escape') {
-      // 不依赖 <dialog> 的原生 cancel：有些页面在捕获阶段吞 Escape，cancel 就不会触发。
-      event.preventDefault();
-      onClose();
     }
   };
 
@@ -415,7 +451,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
         </div>
         <div className="cmdk-list" id={listId} role="listbox" ref={listRef} aria-label={t('palette.dialogLabel')}>
           {rows.length === 0 ? (
-            loading && (scope === 'skill' || scope === 'agent') ? (
+            loading && scope !== 'session' && scope !== 'setting' ? (
               <div className="cmdk-empty">
                 <span className="page-loading-spin" aria-hidden="true" />
                 <span>{t('palette.loading')}</span>
@@ -459,9 +495,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
                       >
                         <span className="cmdk-item-icon">{KIND_ICONS.more}</span>
                         <span className="cmdk-item-main">
-                          <span className="cmdk-item-title">
-                            {t('palette.more', { count: row.count, scope: t(SCOPE_LABEL_KEYS[row.scope]) })}
-                          </span>
+                          <span className="cmdk-item-title">{moreRowLabel(row)}</span>
                         </span>
                         <span className="cmdk-item-tail"><kbd className="cmdk-enter" aria-hidden="true">↵</kbd></span>
                       </div>
@@ -506,9 +540,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
           {activeRow ? (
             <span className="cmdk-hint">
               <kbd>↵</kbd>
-              {activeItem
-                ? activeItem.primary.label
-                : t('palette.more', { count: activeRow.type === 'more' ? activeRow.count : 0, scope: t(SCOPE_LABEL_KEYS[activeRow.type === 'more' ? activeRow.scope : 'all']) })}
+              {activeRow.type === 'more' ? moreRowLabel(activeRow) : activeRow.item.primary.label}
             </span>
           ) : null}
           {activeItem?.secondary ? (

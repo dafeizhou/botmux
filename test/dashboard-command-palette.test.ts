@@ -3,11 +3,12 @@
  *
  *   - model：匹配分档 / 多词 AND / 高亮区间 / 分组排序与截断 / 最近记录 / 唤起键
  *   - sources：会话推荐顺序与跳转目标、设置索引都有译文且能落到真实区块
- *   - 面板交互：键盘上下选择、回车与 ⌘↵ 两种动作、Tab 切分类、输入法组字、Esc
+ *   - 面板交互：键盘上下选择、回车与 ⌘↵ 两种动作、Tab 切分类、输入法组字、Esc、
+ *     无分类 tab 的组原地展开、登录态确认前不拉管理数据、加载中空态、名称映射晚到
  *
  * 面板用原生 <dialog>：react-test-renderer 没有 DOM 宿主，ref 恒为 null，ModalDialog
  * 与面板里的 focus / scroll effect 都有 null 兜底；只 stub 面板真正碰到的浏览器全局
- * （location / localStorage / setTimeout / fetch）。
+ * （location / localStorage / setTimeout / fetch / window 上的 keydown 监听）。
  */
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -32,11 +33,16 @@ import {
   buildSettingItems,
   orderSessionsForPalette,
 } from '../src/dashboard/web/command-palette-sources.js';
-import { CommandPalette, type CommandPaletteProps } from '../src/dashboard/web/command-palette.js';
+import {
+  CommandPalette,
+  __testOnly_resetPaletteRemoteCache,
+  type CommandPaletteProps,
+} from '../src/dashboard/web/command-palette.js';
+import type { PaletteShellContext } from '../src/dashboard/web/command-palette-sources.js';
 import { clearHashQueryParam } from '../src/dashboard/web/dashboard-routes.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { store } from '../src/dashboard/web/store.js';
-import { ui } from '../src/dashboard/web/ui.js';
+import { loadNameMaps, ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -150,6 +156,15 @@ describe('command palette model: search & grouping', () => {
     expect(result.rows.every(row => row.type === 'item')).toBe(true);
     expect(result.rows).toHaveLength(7);
     expect(result.counts.skill).toBe(1);
+  });
+
+  it('groups without a category tab get an in-place expand row instead of being cut off', () => {
+    const bots = Array.from({ length: 5 }, (_, i) => item({ key: `bot:${i}`, kind: 'bot', title: `helper bot ${i}` }));
+    const capped = searchPalette({ items: bots, query: 'helper', scope: 'all' });
+    expect(capped.groups[0]!.rows.at(-1)).toMatchObject({ type: 'more', scope: null, kind: 'bot', count: 5 });
+    const expanded = searchPalette({ items: bots, query: 'helper', scope: 'all', expandedKinds: new Set(['bot']) });
+    expect(expanded.rows).toHaveLength(5);
+    expect(expanded.rows.every(row => row.type === 'item')).toBe(true);
   });
 
   it('breaks score ties with the item boost (active / recent sessions first)', () => {
@@ -289,6 +304,8 @@ describe('CommandPalette interaction', () => {
   const now = Date.now();
   let storageData: Map<string, string>;
   let fakeLocation: { hash: string; href: string };
+  let windowKeyListeners: Array<{ fn: (event: any) => void; capture: boolean }>;
+  let apiResponses: Record<string, () => Promise<unknown>>;
   const mounted: TestRenderer.ReactTestRenderer[] = [];
 
   beforeEach(() => {
@@ -303,13 +320,23 @@ describe('CommandPalette interaction', () => {
       setTimeout: (fn: () => void) => { fn(); return 0; },
       open: vi.fn(),
       dispatchEvent: vi.fn(),
+      addEventListener: (type: string, fn: (event: any) => void, capture?: boolean) => {
+        if (type === 'keydown') windowKeyListeners.push({ fn, capture: capture === true });
+      },
+      removeEventListener: (type: string, fn: (event: any) => void) => {
+        if (type === 'keydown') windowKeyListeners = windowKeyListeners.filter(entry => entry.fn !== fn);
+      },
     });
-    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
-      ok: true,
-      json: async () => (url === '/api/skills'
-        ? { skills: [{ name: 'lark-calendar', description: 'Feishu calendar helper' }] }
-        : { agents: [{ id: 'reviewer', name: 'Code Reviewer' }], links: {} }),
-    })));
+    windowKeyListeners = [];
+    apiResponses = {
+      '/api/skills': async () => ({ skills: [{ name: 'lark-calendar', description: 'Feishu calendar helper' }] }),
+      '/api/agents': async () => ({ agents: [{ id: 'reviewer', name: 'Code Reviewer' }], links: {} }),
+    };
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const body = await (apiResponses[url]?.() ?? Promise.resolve({}));
+      return { ok: url in apiResponses, json: async () => body };
+    }));
+    __testOnly_resetPaletteRemoteCache();
     ui.authed = true;
     ui.workbenchAuthed = true;
     store.replaceSnapshot([
@@ -326,17 +353,20 @@ describe('CommandPalette interaction', () => {
     ui.authed = true;
   });
 
-  function mount(overrides: Partial<CommandPaletteProps> = {}) {
+  function mount(overrides: Partial<CommandPaletteProps> = {}, contextOverrides: Partial<PaletteShellContext> = {}) {
     const onClose = vi.fn();
-    const context = {
+    const context: PaletteShellContext = {
       pages: [{ id: 'settings', href: '#/settings', label: '全局设置', labelKey: 'nav.settings' }],
+      manageDataReady: true,
       setLocale: vi.fn(),
       openCreateSession: vi.fn(),
       openCreateBot: vi.fn(),
+      ...contextOverrides,
     };
+    const props = (): CommandPaletteProps => ({ open: true, onClose, context, mac: true, ...overrides });
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
-      renderer = TestRenderer.create(createElement(CommandPalette, { open: true, onClose, context, mac: true, ...overrides }));
+      renderer = TestRenderer.create(createElement(CommandPalette, props()));
     });
     mounted.push(renderer);
     const input = () => renderer.root.findByProps({ role: 'combobox' });
@@ -366,7 +396,17 @@ describe('CommandPalette interaction', () => {
       act(() => { input().props.onKeyDown(event); });
       return event;
     };
-    return { renderer, onClose, context, input, options, activeTitle, tabs, selectedTab, type, press, textOf };
+    /** 走 window 上注册的捕获阶段 keydown 监听（面板的 Esc 在那里）。 */
+    const pressWindow = (key: string, init: Record<string, unknown> = {}) => {
+      const event = { key, keyCode: 0, isComposing: false, preventDefault: vi.fn(), stopPropagation: vi.fn(), ...init };
+      act(() => { for (const entry of windowKeyListeners.filter(item => item.capture)) entry.fn(event); });
+      return event;
+    };
+    const rerender = (contextPatch: Partial<PaletteShellContext> = {}) => {
+      Object.assign(context, contextPatch);
+      act(() => { renderer.update(createElement(CommandPalette, { ...props(), context: { ...context } })); });
+    };
+    return { renderer, onClose, context, input, options, activeTitle, tabs, selectedTab, type, press, pressWindow, rerender, textOf };
   }
 
   it('starts with the session waiting on you selected and walks the list with arrow keys (wrapping)', () => {
@@ -432,14 +472,56 @@ describe('CommandPalette interaction', () => {
     expect(palette.tabs().map(tab => palette.textOf(tab.children[0]!))).toEqual(['全部', '会话', '设置']);
   });
 
-  it('ignores Enter while an IME is composing and closes on Escape', () => {
+  it('ignores Enter while an IME is composing', () => {
     const palette = mount();
     palette.type('deploy');
     palette.press('Enter', { nativeEvent: { isComposing: true } });
     expect(palette.onClose).not.toHaveBeenCalled();
     expect(fakeLocation.hash).toBe('#/');
-    palette.press('Escape');
+  });
+
+  it('closes on Escape from the window capture phase, ahead of pages that swallow Escape on document', () => {
+    const palette = mount();
+    // 输入法组字中的 Esc 属于候选框。
+    palette.pressWindow('Escape', { isComposing: true });
+    expect(palette.onClose).not.toHaveBeenCalled();
+    const event = palette.pressWindow('Escape');
     expect(palette.onClose).toHaveBeenCalledTimes(1);
+    // 拦下传播，Skill 库多选态等 document 捕获监听就不会先把 Esc 吃掉。
+    expect(event.stopPropagation).toHaveBeenCalled();
+    expect(event.preventDefault).toHaveBeenCalled();
+  });
+
+  it('expands groups without a category tab in place, so every match stays reachable', () => {
+    const pages = ['角色管理', '群组管理', 'Skill 管理', 'Bot 管理', '插件管理', '团队管理'].map((label, i) => ({
+      id: `page-${i}`, href: `#/page-${i}`, label,
+    }));
+    const palette = mount({}, { pages });
+    palette.type('管理');
+    const more = palette.options().find(node => palette.textOf(node).includes('展开全部 6 条'))!;
+    expect(more).toBeDefined();
+    act(() => { more.props.onClick(); });
+    expect(palette.options().filter(node => palette.textOf(node).includes('管理'))).toHaveLength(6);
+    // 选中项落在展开出来的第一条（原先被截掉的第 5 个），而不是跳回顶部。
+    expect(palette.activeTitle()).toBe('插件管理');
+    expect(palette.selectedTab()).toBe('全部');
+    expect(fakeLocation.hash).toBe('#/');
+  });
+
+  it('waits for the auth state before fetching skills and agents', () => {
+    const palette = mount({}, { manageDataReady: false });
+    expect(fetch).not.toHaveBeenCalled();
+    palette.rerender({ manageDataReady: true });
+    expect(fetch).toHaveBeenCalledWith('/api/skills', expect.anything());
+  });
+
+  it('shows a loading state instead of "no results" while skills and agents are still loading', () => {
+    apiResponses['/api/skills'] = () => new Promise(() => {});
+    const palette = mount();
+    palette.type('calendar');
+    const text = palette.textOf(palette.renderer.root.findByProps({ role: 'listbox' }));
+    expect(text).toContain('正在加载 Skill 与 Agent…');
+    expect(text).not.toContain('没有找到');
   });
 
   it('"show all" switches to the category instead of navigating', () => {
@@ -453,5 +535,19 @@ describe('CommandPalette interaction', () => {
     expect(palette.selectedTab()).toBe('会话');
     expect(palette.options()).toHaveLength(8);
     expect(fakeLocation.hash).toBe('#/');
+  });
+
+  it('refreshes cached session rows once bot names arrive late', async () => {
+    store.replaceSnapshot([
+      { sessionId: 's-late', status: 'working', title: 'late names', larkAppId: 'cli_late_name', lastMessageAt: now },
+    ], []);
+    apiResponses['/api/groups?view=names'] = async () => ({ bots: [{ larkAppId: 'cli_late_name', botName: '晚到的名字' }], chats: [] });
+    const palette = mount();
+    palette.type('late names');
+    const subtitle = () => palette.textOf(palette.renderer.root.findAllByProps({ className: 'cmdk-item-sub' })[0]!);
+    expect(subtitle()).toContain('cli_late_name');
+    await act(async () => { await loadNameMaps(); });
+    palette.rerender();
+    expect(subtitle()).toContain('晚到的名字');
   });
 });

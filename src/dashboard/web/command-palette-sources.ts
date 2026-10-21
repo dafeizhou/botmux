@@ -32,6 +32,11 @@ export interface PalettePageEntry {
 /** 壳层（app.tsx）注入的能力：页面清单与只有壳层才拿得到的动作。 */
 export interface PaletteShellContext {
   pages: PalettePageEntry[];
+  /**
+   * 登录态已经从 `/api/settings` 确认且是管理身份，才去拉 Skill / Agent。`ui.authed` 在
+   * 确认前默认 true；那个窗口里按 ⌘K 会让公开只读访客吃到 401、被全局 fetch 包装弹出登录浮层。
+   */
+  manageDataReady: boolean;
   setLocale(locale: DashboardLocale): void;
   openCreateSession(): void;
   openCreateBot(): void;

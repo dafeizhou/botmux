@@ -12,7 +12,10 @@ export const PALETTE_SCOPES: readonly PaletteScope[] = ['all', 'session', 'skill
 /** 空查询 / 同分时的分组顺序。 */
 const KIND_ORDER: readonly PaletteKind[] = ['session', 'action', 'skill', 'agent', 'setting', 'bot', 'page'];
 
-/** 「全部」作用域下每组最多展示几条；超出给一行「查看全部」切到对应作用域。 */
+/**
+ * 「全部」作用域下每组最多展示几条。超出时补一行「查看全部」：有对应分类 tab 的切过去，
+ * 没有的（机器人 / 页面 / 快捷操作）原地展开，保证每个命中都够得着。
+ */
 const ALL_SCOPE_GROUP_LIMIT: Record<PaletteKind, number> = {
   session: 5,
   skill: 4,
@@ -69,7 +72,8 @@ export interface ItemMatch {
 
 export type PaletteRow =
   | { type: 'item'; item: PaletteItem; match: ItemMatch | null }
-  | { type: 'more'; scope: PaletteScope; kind: PaletteKind; count: number };
+  /** `scope` 为 null：该类没有分类 tab，选中时在「全部」里原地展开。 */
+  | { type: 'more'; scope: PaletteScope | null; kind: PaletteKind; count: number };
 
 export interface PaletteGroup {
   /** `recent` 或某个 kind。 */
@@ -337,6 +341,8 @@ export function searchPalette(input: {
   query: string;
   scope: PaletteScope;
   recentKeys?: readonly string[];
+  /** 「全部」里已被原地展开、不再截断的分组。 */
+  expandedKinds?: ReadonlySet<PaletteKind>;
 }): PaletteSearchResult {
   const { items, scope } = input;
   const tokens = tokenizeQuery(input.query);
@@ -401,11 +407,12 @@ export function searchPalette(input: {
   ranked.sort((a, b) => b.best - a.best || kindRank(a.kind) - kindRank(b.kind));
 
   const groups: PaletteGroup[] = ranked.map(({ kind, list }) => {
-    const limit = scope === 'all' ? ALL_SCOPE_GROUP_LIMIT[kind] : SCOPE_RESULT_LIMIT;
+    const limit = scope !== 'all'
+      ? SCOPE_RESULT_LIMIT
+      : input.expandedKinds?.has(kind) ? Infinity : ALL_SCOPE_GROUP_LIMIT[kind];
     const rows: PaletteRow[] = list.slice(0, limit).map(({ item, match }) => ({ type: 'item', item, match }));
-    const kindScope = scopeOfKind(kind);
-    if (scope === 'all' && list.length > limit && kindScope) {
-      rows.push({ type: 'more', scope: kindScope, kind, count: list.length });
+    if (scope === 'all' && list.length > limit) {
+      rows.push({ type: 'more', scope: scopeOfKind(kind), kind, count: list.length });
     }
     return { id: kind, total: list.length, rows };
   });
