@@ -17930,6 +17930,20 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+// Riff runs on a different machine. Dispatch its stateful helpers on the owning
+// host before any command can accidentally read/write sandbox-local stores.
+if (process.env.BOTMUX_SESSION_ID && !command?.startsWith('__')
+  && (command === 'riff-host-bind' || process.env.BOTMUX_RIFF_HOST_TOOLS === '1'
+    || process.env.BOTMUX_RIFF_HOST_BINDING || process.env.BOTMUX_LARK_APP_SECRET)) {
+  try {
+    const { maybeRunRiffHostTool } = await import('./cli/riff-host-tools.js');
+    if (await maybeRunRiffHostTool(process.argv.slice(2), readStdin)) process.exit(process.exitCode ?? 0);
+  } catch (error) {
+    console.error(`botmux Riff host: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
+
 if (command === '__orca-relay-local') {
   const { callLocalOrcaRelay } = await import('./services/orca-local-relay.js');
   const input = JSON.parse(readFileSync(0, 'utf-8'));

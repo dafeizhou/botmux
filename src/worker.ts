@@ -264,6 +264,7 @@ import {
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
+  isRemoteAccessEnabled,
 } from './global-config.js';
 import {
   stopSessionScope,
@@ -362,6 +363,8 @@ import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
+import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE } from './services/riff-host-tools.js';
+import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
 import { createServer as createNetServer, type Server as NetServer, type Socket } from 'node:net';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
@@ -2705,6 +2708,7 @@ let lastAbortedCloseRequestId: string | null = null;
 let shutdownDetachRequestId: string | null = null;
 let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
+const riffHostTools = new RiffHostTools();
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
@@ -20495,7 +20499,54 @@ async function spawnCli(
     // `riffCfg` is `cfg.backendConfig` already narrowed once at the top of this
     // riff-only branch — same object, so master's owner re-freeze above is
     // unaffected; keeping the typed alias avoids re-widening to the shared union.
-    riffBackendConfig = Object.assign({}, riffCfg, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
+    // The binding is minted when the exact turn is dispatched, including each
+    // follow-up (Riff only applies config.env at task creation).
+    if (!noTransport && !isWorkflowWorker()) mergedEnv.BOTMUX_RIFF_HOST_TOOLS = '1';
+    else delete mergedEnv.BOTMUX_RIFF_HOST_TOOLS;
+    delete mergedEnv.BOTMUX_RIFF_HOST_BINDING;
+    if (!noTransport && !isWorkflowWorker()) delete mergedEnv.BOTMUX_LARK_APP_SECRET;
+    riffBackendConfig = Object.assign({}, riffCfg, {
+      env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId,
+      hostToolsBinding: noTransport || isWorkflowWorker() ? undefined : () => {
+        const authority = activeTurnAuthority.identity();
+        if (!authority.turnId || !sessionId || noTransport || isWorkflowWorker()) throw new Error('riff_host_turn_unavailable');
+        const turnId = authority.turnId;
+        const attempt = authority.dispatchAttempt;
+        const observedBackend = backend;
+        // Riff has no local CLI PID. Its owning worker is the authenticated
+        // ancestor of host-tool children, and receives the normal rotating marker.
+        const markers = join(process.env.SESSION_DATA_DIR ?? config.session.dataDir, '.botmux-cli-pids');
+        mkdirSync(markers, { recursive: true });
+        bindCliPidMarker(join(markers, String(process.pid)), process.pid);
+        const address = httpServer?.address();
+        if (!address || typeof address === 'string') throw new Error('riff_host_endpoint_unavailable');
+        const publicBase = (isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null) ?? publicReverseProxyBaseUrl();
+        const host = config.web.externalHost;
+        const url = riffCfg.hostToolsUrl?.replaceAll('{sessionId}', encodeURIComponent(sessionId)) ?? (publicBase
+          ? `${publicBase.replace(/\/$/, '')}/s/${sessionId}${RIFF_HOST_TOOLS_ROUTE}`
+          : `http://${host.includes(':') ? `[${host}]` : host}:${address.port}${RIFF_HOST_TOOLS_ROUTE}`);
+        const endpoint = new URL(url);
+        if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password
+          || endpoint.search || endpoint.hash || endpoint.pathname !== RIFF_HOST_TOOLS_ROUTE && !endpoint.pathname.endsWith(RIFF_HOST_TOOLS_ROUTE)) throw new Error('riff_host_endpoint_invalid');
+        const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_LARK_APP_ID: cfg.larkAppId, BOTMUX_CHAT_ID: cfg.chatId,
+          BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage ? 'thread' : 'chat',
+          BOTMUX_LINK_REF_TURN_MODE: currentBotmuxLinkRefMode };
+        delete env.BOTMUX_LARK_TOOL_BINDING;
+        if (cfg.larkToolBinding !== false) {
+          prepareLarkToolEnv({ env, dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+            sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+        }
+        const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, cfg.loadedBotsConfigProvenance);
+        if (pinned) env.BOTS_CONFIG = pinned;
+        return riffHostTools.bind(url, {
+          sessionId, turnId, dispatchAttempt: attempt,
+          dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir, env,
+          isCurrent: () => backend === observedBackend && effectiveBackendType === 'riff'
+            && !fatalWorkerErrorPending && activeTurnAuthority.identity().turnId === turnId
+            && activeTurnAuthority.identity().dispatchAttempt === attempt,
+        });
+      },
+    });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
     // 推导——绝不扫描任意非 git 目录的子目录（home/仓库集合目录会乱带仓库）。
@@ -25961,6 +26012,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         log(`Bad worker HTTP URL rejected: ${JSON.stringify(req.url ?? '')}`);
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end('Bad Request');
+        return;
+      }
+      // This endpoint has its own per-turn capability. A terminal read/write
+      // token never grants access to host tools, and tool tokens never grant
+      // terminal access.
+      if (url.pathname === RIFF_HOST_TOOLS_ROUTE) {
+        void riffHostTools.handle(req, res).catch(() => {
+          if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{"error":"riff_host_unavailable"}');
+        });
         return;
       }
       const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);

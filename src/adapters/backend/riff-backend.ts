@@ -44,7 +44,7 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
   'COMPLETION CONTRACT: a turn is complete ONLY after `botmux send` actually ran and printed ✓ success. Writing the answer solely in your final report/output does NOT reach the user — always run `botmux send` first, then summarize in the report.',
   'Keep final answers concise. For images/files: write them to disk then send via `botmux send --images/--files`.',
   '',
-  'LAST-RESORT fallback (only if the npm install itself fails): call the Feishu Open API directly with the injected BOTMUX_LARK_APP_ID/SECRET — fetch a tenant_access_token, then POST im/v1/messages?receive_id_type=chat_id to BOTMUX_CHAT_ID. Still never use non-BOTMUX credentials.',
+  'LAST-RESORT fallback (only if no host-tools binding is provided and the npm install itself fails): call the Feishu Open API directly with the injected BOTMUX_LARK_APP_ID/SECRET — fetch a tenant_access_token, then POST im/v1/messages?receive_id_type=chat_id to BOTMUX_CHAT_ID. Still never use non-BOTMUX credentials.',
 ].join('\n');
 
 /**
@@ -73,6 +73,11 @@ const MANDATORY_SETUP_COMMANDS = [
 
 export interface RiffBackendConfig {
   baseUrl: string;
+  /** Optional externally reachable worker endpoint; otherwise use the existing
+   * terminal reverse proxy/platform URL, or the worker's advertised address. */
+  hostToolsUrl?: string;
+  /** Worker-only dispatch factory. Never supplied by the Riff API or sandbox. */
+  hostToolsBinding?: () => import('../../services/riff-host-tools.js').RiffHostBinding;
   templateId?: string;
   /** @deprecated riff 服务端已收敛仅支持 codex（其它值 400）；本字段不再被读取，
    *  任务一律以 agent=codex 创建。保留仅为兼容存量 bots.json。 */
@@ -2033,7 +2038,11 @@ export class RiffBackend implements SessionBackend {
     const sys = custom
       ? `${DEFAULT_RIFF_SYSTEM_PROMPT}\n\n<additional_instructions>\n${custom}\n</additional_instructions>`
       : DEFAULT_RIFF_SYSTEM_PROMPT;
-    return `<system>\n${sys}\n</system>\n\n${prompt}`;
+    const binding = this.config.hostToolsBinding?.();
+    const host = binding
+      ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups):\nbotmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}\nAll stateful botmux helpers execute on the owning host. Never print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
+      : '';
+    return `<system>\n${sys}${host}\n</system>\n\n${prompt}`;
   }
 
   /**
