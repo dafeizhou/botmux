@@ -28,7 +28,7 @@ export interface RiffHostResult {
 }
 export interface RiffHostContext {
   sessionId: string; turnId: string; dispatchAttempt?: number;
-  dataDir: string; env: NodeJS.ProcessEnv; cliPath?: string;
+  dataDir: string; env: NodeJS.ProcessEnv; cliPath?: string; workingDir?: string;
   isCurrent: () => boolean;
 }
 
@@ -37,8 +37,8 @@ export interface RiffHostContext {
 // daemon policies still authorize the resulting operation.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode --text',
-    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice',
+    values: '--response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
+    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
     files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
   ask: { sub: ['buttons'], values: '--options --timeout', bools: '--json --multi', files: '--questions-file' },
@@ -137,6 +137,10 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
       argv[i] = path;
     }
     if (argv[0] === 'quoted') argv.push('--remote-runner-session-tool');
+    if (argv[0] === 'schedule' && argv[1] === 'add') {
+      if (!ctx.workingDir) throw new Error('riff_host_working_directory_unavailable');
+      argv.push('--workdir', ctx.workingDir);
+    }
     const env = buildRelayHostEnv(ctx.env);
     delete env[RIFF_HOST_BINDING_ENV];
     env.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
@@ -194,7 +198,9 @@ export class RiffHostTools {
   bind(url: string, context: RiffHostContext): RiffHostBinding {
     this.context = context;
     this.binding = { url, token: randomBytes(32).toString('base64url'), sessionId: context.sessionId, turnId: context.turnId };
-    if (isStandaloneBinary()) {
+    // Riff's sandbox CLI runs on Linux x64; a macOS/ARM host executable is
+    // not an installable sandbox artifact. Those hosts keep the npm setup path.
+    if (isStandaloneBinary() && process.platform === 'linux' && process.arch === 'x64') {
       cliSha256 ??= createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
       this.binding.cliSha256 = cliSha256;
     }
@@ -211,6 +217,7 @@ export class RiffHostTools {
     let retained = entries.length;
     for (const entry of entries) {
       if (this.operations.has(entry.path)) continue;
+      if (Date.now() - entry.mtime <= RECEIPT_TTL_MS && retained < RECEIPT_LIMIT) continue;
       let op: Operation;
       try { op = JSON.parse(readFileSync(entry.path, 'utf8')); } catch { continue; }
       // A current-turn receipt is never evicted: replay must not execute twice.

@@ -19,7 +19,7 @@ const roots: string[] = [], servers: Server[] = [];
 function root(): string { const r = mkdtempSync(join(tmpdir(), 'riff-host-test-')); roots.push(r); return r; }
 const request = (argv = ['project', 'status'], operationId = 'operation-0001') => ({ argv, operationId });
 function context(dataDir = root(), overrides: Partial<RiffHostContext> = {}): RiffHostContext {
-  return { sessionId: 'session-1', turnId: 'turn-1', dataDir, env: { ...process.env }, isCurrent: () => true, ...overrides };
+  return { sessionId: 'session-1', turnId: 'turn-1', dataDir, workingDir: dataDir, env: { ...process.env }, isCurrent: () => true, ...overrides };
 }
 async function listen(gateway: RiffHostTools): Promise<string> {
   const s = createServer((req, res) => { void gateway.handle(req, res); });
@@ -36,6 +36,34 @@ afterEach(async () => {
 });
 
 describe('Riff host boundary', () => {
+  it.each(['oc_test', 'oc_elsewhere', '__missing__'])('enforces the chat boundary in the real card patch CLI: %s', async chatId => {
+    const directory = root(), app = 'cli_test';
+    mkdirSync(join(directory, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(directory, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+      sessionId: 'session-1', turnId: 'turn-1', procStart: readProcessStartIdentity(process.pid),
+    }));
+    const bots = join(directory, 'bots.json');
+    writeFileSync(bots, JSON.stringify([{ larkAppId: app, larkAppSecret: 'test', cliId: 'riff', backendType: 'riff' }]));
+    seedPersistedSessionRows(directory, app, { 'session-1': {
+      sessionId: 'session-1', larkAppId: app, status: 'active', pid: process.pid, cliId: 'riff', backendType: 'riff',
+      chatId: 'oc_test', rootMessageId: 'om_root', chatType: 'group', scope: 'thread', workingDir: directory,
+    } });
+    const result = await executeRiffHostTool(request(['card', 'patch', '--message-id', 'om_patch', '--card-json',
+      JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'updated' }] } })]),
+    context(directory, { cliPath: fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url)),
+      env: { ...process.env, BOTS_CONFIG: bots, BOTMUX_LARK_APP_ID: app, BOTMUX_CHAT_ID: 'oc_test',
+        BOTMUX_ROOT_MESSAGE_ID: 'om_root', BOTMUX_LARK_TOOL_BINDING: undefined, BOTMUX_TEST_PATCH_CHAT_ID: chatId,
+        ...(isBunRuntime() ? {} : { NODE_OPTIONS: `--import=${createRequire(import.meta.url).resolve('tsx')}` }) } }));
+    if (chatId === 'oc_test') {
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toContain('"method":"PATCH"');
+    } else {
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain('riff_host_message_outside_session');
+      expect(result.stdout).not.toContain('CAPTURE_REPLY=');
+    }
+  }, 30_000);
+
   it('refuses cards from another chat and fails closed when lookup fails', async () => {
     await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => 'oc_here')).resolves.toBeUndefined();
     await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => 'oc_elsewhere')).rejects.toThrow('outside_session');
@@ -53,6 +81,23 @@ describe('Riff host boundary', () => {
     utimesSync(old, ancient, ancient); utimesSync(current, ancient, ancient);
     const gateway = new RiffHostTools(); gateway.bind(await listen(gateway), ctx);
     expect(readdirSync(directory)).toEqual([`${'b'.repeat(64)}.json`]);
+  });
+
+  it('refuses more receipts instead of evicting a current-turn operation, then reclaims prior turns', async () => {
+    const ctx = context(), directory = join(ctx.dataDir, 'sessions', ctx.sessionId, 'riff-host-operations');
+    mkdirSync(directory, { recursive: true });
+    for (let i = 0; i < 1500; i++) writeFileSync(join(directory, `${i.toString(16).padStart(64, '0')}.json`),
+      JSON.stringify({ turnId: ctx.turnId, fingerprint: 'c'.repeat(64) }));
+    const execute = vi.fn(async () => ({ exitCode: 0, stdout: 'ok', stderr: '' }));
+    const gateway = new RiffHostTools(execute), url = await listen(gateway);
+    const binding = gateway.bind(url, ctx);
+    expect((await post(binding)).status).toBe(429);
+    expect(readdirSync(directory)).toHaveLength(1500);
+    expect(execute).not.toHaveBeenCalled();
+    const next = gateway.bind(url, { ...ctx, turnId: 'next-turn' });
+    expect((await callRiffHostTool(next, request())).stdout).toBe('ok');
+    expect(readdirSync(directory).length).toBeLessThan(1500);
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('accepts send aliases and stream operations without allowing host paths', async () => {
@@ -121,6 +166,33 @@ describe('Riff host boundary', () => {
     expect(parseRiffHostRequest(r).files).toHaveLength(1);
     const stdin = await prepareRiffHostRequest(['send', '--no-mention'], async () => 'heredoc');
     expect(stdin.stdin).toBe('heredoc');
+  });
+
+  it.each(['--voice', '--text', '--card'])('keeps the body after the boolean send flag %s', async flag => {
+    const read = vi.fn(async () => { throw new Error('unexpected stdin'); });
+    const prepared = await prepareRiffHostRequest(['send', flag, 'answer', '--no-mention'], read);
+    expect(prepared.argv).toEqual(['send', flag, 'answer', '--no-mention']);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('uploads stream stdin as content rather than selecting a host file', async () => {
+    const read = vi.fn(async () => 'line 1\nline 2');
+    const prepared = await prepareRiffHostRequest(['card', 'stream', 'write', '--stream-id', `cs_${'a'.repeat(32)}`,
+      '--element-id', 'progress', '--content-file', '-'], read);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(parseRiffHostRequest(prepared).argv.at(-1)).toBe('riff-upload:0');
+    expect(Buffer.from(prepared.files![0]!.dataBase64, 'base64').toString()).toBe('line 1\nline 2');
+  });
+
+  it('pins schedule creation to the host session working directory and refuses a missing directory', async () => {
+    const directory = root(), fixture = join(directory, 'schedule.mjs');
+    writeFileSync(fixture, 'console.log(JSON.stringify(process.argv.slice(2)));');
+    const argv = ['schedule', 'add', 'every 1h', 'prompt'];
+    const result = await executeRiffHostTool(request(argv), context(directory, { cliPath: fixture }));
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([...argv, '--workdir', directory]);
+    await expect(executeRiffHostTool(request(argv), context(directory, { cliPath: fixture, workingDir: undefined })))
+      .rejects.toThrow('working_directory_unavailable');
   });
 
   it('keeps quoted-message reads constrained to the authenticated session chat', async () => {
@@ -285,6 +357,14 @@ describe('Riff host boundary', () => {
     await expect(maybeRunRiffHostTool(['project', 'status'], async () => '', {
       BOTMUX_SESSION_ID: 'session-1', BOTMUX_RIFF_HOST_TOOLS: '1', SESSION_DATA_DIR: root(),
     })).rejects.toThrow();
+  });
+
+  it('does not activate an old binding without this invocation explicitly enabling host tools', async () => {
+    const env = { BOTMUX_SESSION_ID: 'session-1', SESSION_DATA_DIR: root() };
+    const binding = { sessionId: 'session-1', turnId: 'turn', token: 'a'.repeat(43), url: 'http://127.0.0.1:1/api/riff-host-tools' };
+    installRiffHostBinding(Buffer.from(JSON.stringify(binding)).toString('base64url'), env);
+    expect(await maybeRunRiffHostTool(['project', 'status'], async () => '', env)).toBe(false);
+    expect(await maybeRunRiffHostTool(['project', 'status'], async () => '', { ...env, BOTMUX_RIFF_HOST_TOOLS: '0' })).toBe(false);
   });
 
   it('installs a binding only for its own app-injected session', () => {

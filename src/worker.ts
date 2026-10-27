@@ -20540,7 +20540,7 @@ async function spawnCli(
         if (pinned) env.BOTS_CONFIG = pinned;
         return riffHostTools.bind(url, {
           sessionId, turnId, dispatchAttempt: attempt,
-          dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir, env,
+          dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir, env, workingDir: cfg.workingDir,
           isCurrent: () => backend === observedBackend && effectiveBackendType === 'riff'
             && !fatalWorkerErrorPending && activeTurnAuthority.identity().turnId === turnId
             && activeTurnAuthority.identity().dispatchAttempt === attempt,

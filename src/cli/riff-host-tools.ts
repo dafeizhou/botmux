@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import { request as httpRequest } from 'node:http';
@@ -34,11 +34,19 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
   const paths = riffHostFileArguments(args);
   const files: NonNullable<RiffHostRequest['files']> = [];
   let total = 0;
+  let stdinValue: string | undefined;
+  const stdin = async () => stdinValue ??= await readStdin();
   for (const i of paths) {
     const path = args[i]!;
-    const stat = statSync(path);
-    if (!stat.isFile() || stat.size > 24 * 1024 * 1024) throw new Error('riff_host_upload_too_large');
-    const bytes = readFileSync(path);
+    const fromStdin = args[i - 1] === '--content-file' && path === '-';
+    let bytes: Buffer;
+    if (fromStdin) bytes = Buffer.from(await stdin());
+    else {
+      const stat = statSync(path);
+      if (!stat.isFile() || stat.size > 24 * 1024 * 1024) throw new Error('riff_host_upload_too_large');
+      bytes = readFileSync(path);
+    }
+    if (bytes.length > 24 * 1024 * 1024) throw new Error('riff_host_upload_too_large');
     total += bytes.length;
     if (total * 4 / 3 > RIFF_HOST_MAX_BYTES - 1024 * 1024) throw new Error('riff_host_upload_too_large');
     // Keep only an inert filename; paths and unicode names never select host files.
@@ -48,18 +56,18 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
   }
   // cmdSend reads stdin only when neither a positional body nor a card/content
   // file was supplied. An empty pipe must not swallow a positional message.
-  let stdin: string | undefined;
+  let body: string | undefined;
   const hasFlag = (flag: string) => args.some(a => a === flag || a.startsWith(`${flag}=`));
   if (args[0] === 'send' && !hasFlag('--content-file') && !hasFlag('--card-file') && !hasFlag('--card-json')) {
-  const valueFlags = new Set(['--response-kind', '--mention', '--layout', '--expected-link', '--quote', '--as', '--plugin-card-action', '--image-mode', '--text', '--images', '--image', '--files', '--file', '--videos', '--video-covers', '--completion-proposal-file']);
+    const valueFlags = new Set(['--response-kind', '--mention', '--layout', '--expected-link', '--quote', '--as', '--plugin-card-action', '--image-mode', '--images', '--image', '--files', '--file', '--videos', '--video-covers', '--completion-proposal-file']);
     let positional = false;
     for (let i = 1; i < args.length; i++) {
       if (valueFlags.has(args[i]!)) { i++; continue; }
       if (!args[i]!.startsWith('-')) positional = true;
     }
-    if (!positional) stdin = await readStdin();
+    if (!positional) body = await stdin();
   }
-  const request = { operationId: randomUUID(), argv: args, stdin, ...(files.length ? { files } : {}) };
+  const request = { operationId: randomUUID(), argv: args, stdin: body, ...(files.length ? { files } : {}) };
   if (Buffer.byteLength(JSON.stringify(request)) > RIFF_HOST_MAX_BYTES) throw new Error('riff_host_request_too_large');
   return request;
 }
@@ -142,7 +150,7 @@ export async function maybeRunRiffHostTool(argv: string[], readStdin: () => Prom
     return true;
   }
   const path = bindingPath(env);
-  if (env.BOTMUX_RIFF_HOST_TOOLS !== '1' && !existsSync(path)) return false;
+  if (env.BOTMUX_RIFF_HOST_TOOLS !== '1') return false;
   if (['--version', '-v', '--help', '-h', 'help', 'capabilities', 'skill'].includes(argv[0] ?? '')
     || (argv[0] === 'send' && argv.includes('--dry-run'))) return false;
   const b = JSON.parse(readFileSync(path, 'utf8')) as RiffHostBinding;
