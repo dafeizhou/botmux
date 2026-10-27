@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { writeAndFlush } from './stdout-flush.js';
@@ -62,7 +64,35 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
   return request;
 }
 
-export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHostRequest, fetchImpl = fetch): Promise<RiffHostResult> {
+// A host capability is sent directly to its deployment-owned endpoint. Bun's
+// global fetch snapshots proxy variables at startup and can hand private IPv6
+// addresses (and their credentials) to the sandbox's HTTP egress proxy.
+async function riffHostDirectFetch(url: string, init: RequestInit): Promise<Response> {
+  const endpoint = new URL(url);
+  if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('riff_host_endpoint_invalid');
+  const headers = Object.fromEntries(new Headers(init.headers).entries());
+  const body = typeof init.body === 'string' ? init.body : undefined;
+  if (body !== undefined) headers['content-length'] = String(Buffer.byteLength(body));
+  return new Promise((resolve, reject) => {
+    const req = (endpoint.protocol === 'https:' ? httpsRequest : httpRequest)(endpoint, {
+      method: init.method, headers, signal: init.signal ?? undefined,
+    }, res => {
+      const chunks: Buffer[] = []; let size = 0;
+      res.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > RIFF_HOST_MAX_BYTES) { res.destroy(new Error('riff_host_response_too_large')); return; }
+        chunks.push(Buffer.from(chunk));
+      });
+      res.on('error', reject);
+      res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 502 })));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHostRequest,
+  fetchImpl: (url: string, init: RequestInit) => Promise<Response> = riffHostDirectFetch): Promise<RiffHostResult> {
   const headers = { 'x-riff-host-token': binding.token, 'content-type': 'application/json' };
   const deadline = Date.now() + 62 * 60_000;
   let posted = false, transportFailures = 0;

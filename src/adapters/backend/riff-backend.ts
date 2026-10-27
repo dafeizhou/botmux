@@ -2040,7 +2040,7 @@ export class RiffBackend implements SessionBackend {
       : DEFAULT_RIFF_SYSTEM_PROMPT;
     const binding = this.config.hostToolsBinding?.();
     const install = binding?.cliSha256
-      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != '${binding.cliSha256}' ]; then artifact="$(mktemp)"; curl --fail --silent --show-error --max-time 180 -H 'x-riff-host-token: ${binding.token}' '${binding.url}?artifact=cli' -o "$artifact"; printf '%s  %s\\n' '${binding.cliSha256}' "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
+      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != '${binding.cliSha256}' ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H 'x-riff-host-token: ${binding.token}' '${binding.url}?artifact=cli' -o "$artifact"; printf '%s  %s\\n' '${binding.cliSha256}' "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
       : '';
     const host = binding
       ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${install}BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}\nAll stateful botmux helpers execute on the owning host. Never print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
