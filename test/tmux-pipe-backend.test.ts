@@ -2291,4 +2291,32 @@ describe('reattach remain-on-exit reapply vs tmux version', () => {
     expect(vCalls).toBe(2);
     expect(roeReapplyCalls().length).toBe(1);
   });
+
+  // Unknown at the reattach boundary must fail CLOSED too, symmetrically with
+  // the new-session chain's own unknown-version tripwire: sending `failed` to
+  // an old tmux whose -V stayed unreadable is the #2418 direction. The
+  // rejection is currently swallowed (this line is last inside the shared
+  // try/catch, so the worst case is just this session's pre-#2164 behaviour),
+  // which is exactly why the gate needs a test — a future `null || supported`
+  // flip here otherwise lands silently (the same flip at the creation point
+  // is already caught by the chain-shape assertions above).
+  it('skips the reattach remain-on-exit reapply when the version stays unreadable (unknown fails CLOSED)', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') {
+        vCalls += 1;
+        throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      }
+      return '' as any;
+    }) as any);
+    // A failed gate probe left a null inside the short TTL; the boundary
+    // resolver re-probes exactly once and still gets no answer.
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-unknown', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(vCalls).toBe(2);
+    expect(roeReapplyCalls()).toEqual([]);
+  });
 });
