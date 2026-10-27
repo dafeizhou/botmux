@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createReadStream, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -8,14 +8,18 @@ import { StringDecoder } from 'node:string_decoder';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
 import { quotedAttachments } from './remote-runner-session-tool.js';
+import { isStandaloneBinary } from '../core/self-spawn.js';
 
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
 export const RIFF_HOST_MAX_BYTES = 48 * 1024 * 1024;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const UPLOAD_PREFIX = 'riff-upload:';
+const RECEIPT_LIMIT = 1000;
+const RECEIPT_TTL_MS = 7 * 24 * 60 * 60_000;
+let cliSha256: string | undefined;
 
-export interface RiffHostBinding { url: string; token: string; sessionId: string; turnId: string }
+export interface RiffHostBinding { url: string; token: string; sessionId: string; turnId: string; cliSha256?: string }
 export interface RiffHostUpload { name: string; dataBase64: string }
 export interface RiffHostRequest { operationId: string; argv: string[]; stdin?: string; files?: RiffHostUpload[] }
 export interface RiffHostResult {
@@ -33,9 +37,9 @@ export interface RiffHostContext {
 // daemon policies still authorize the resulting operation.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--response-kind --mention --layout --expected-link --quote --as --voice --plugin-card-action --card-json',
-    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self',
-    files: '--content-file --card-file --images --files --videos --video-covers --completion-proposal-file',
+    values: '--response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode --text',
+    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice',
+    files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
   ask: { sub: ['buttons'], values: '--options --timeout', bools: '--json --multi', files: '--questions-file' },
   auth: { sub: ['request', 'wait'], values: '--scope --request-id', bools: '--json --allow-unknown' },
@@ -59,6 +63,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
   },
   workflow: { sub: ['list', 'show', 'run', 'start', 'retry', 'cancel', 'grant'], values: '--param --reason --node', bools: '--json' },
   card: { sub: ['patch'], values: '--message-id --card-json --plugin-card-action', files: '--card-file' },
+  'card.stream': { sub: ['open', 'write', 'finish', 'snapshot', 'reanchor'], values: '--message-id --stream-id --element-id --summary --content', files: '--content-file', bools: '--json' },
+  whiteboard: { sub: ['status'], bools: '--json' },
   tabs: { sub: ['list', 'add', 'update', 'remove', 'sort'], values: '--name --url', bools: '--json' },
   'top-notice': { sub: ['set'], bools: '--json' },
 };
@@ -67,12 +73,13 @@ function words(value?: string): Set<string> { return new Set(value?.split(' ') ?
 
 /** Validate both before upload on the client and again at the host boundary. */
 export function riffHostFileArguments(argv: string[]): number[] {
-  const spec = SPECS[argv[0] ?? ''];
+  const nested = argv[0] === 'card' && argv[1] === 'stream';
+  const spec = SPECS[nested ? 'card.stream' : argv[0] ?? ''];
   if (!spec) throw new Error('riff_host_command_unsupported');
   const values = words(spec.values), bools = words(spec.bools), files = words(spec.files);
   const paths: number[] = [];
-  if (spec.sub && !spec.sub.includes(argv[1] ?? '')) throw new Error('riff_host_subcommand_unsupported');
-  for (let i = spec.sub ? 2 : 1; i < argv.length; i++) {
+  if (spec.sub && !spec.sub.includes(argv[nested ? 2 : 1] ?? '')) throw new Error('riff_host_subcommand_unsupported');
+  for (let i = spec.sub ? (nested ? 3 : 2) : 1; i < argv.length; i++) {
     const arg = argv[i]!;
     if (!arg.startsWith('-')) {
       if (argv[0] === 'board' && argv[1] === 'attach' && i >= 3) paths.push(i);
@@ -187,15 +194,48 @@ export class RiffHostTools {
   bind(url: string, context: RiffHostContext): RiffHostBinding {
     this.context = context;
     this.binding = { url, token: randomBytes(32).toString('base64url'), sessionId: context.sessionId, turnId: context.turnId };
+    if (isStandaloneBinary()) {
+      cliSha256 ??= createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
+      this.binding.cliSha256 = cliSha256;
+    }
+    this.sweep(context);
     return this.binding;
+  }
+
+  private sweep(ctx: RiffHostContext): number {
+    const directory = join(ctx.dataDir, 'sessions', ctx.sessionId, 'riff-host-operations');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const entries = readdirSync(directory).filter(n => /^[a-f0-9]{64}\.json$/.test(n))
+      .map(n => { const path = join(directory, n); return { path, mtime: statSync(path).mtimeMs }; })
+      .sort((a, b) => a.mtime - b.mtime);
+    let retained = entries.length;
+    for (const entry of entries) {
+      if (this.operations.has(entry.path)) continue;
+      let op: Operation;
+      try { op = JSON.parse(readFileSync(entry.path, 'utf8')); } catch { continue; }
+      // A current-turn receipt is never evicted: replay must not execute twice.
+      if (op.turnId === ctx.turnId) continue;
+      if (Date.now() - entry.mtime > RECEIPT_TTL_MS || retained >= RECEIPT_LIMIT) {
+        rmSync(entry.path, { force: true }); retained--;
+      }
+    }
+    return retained;
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const json = (status: number, body: unknown) => { res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); };
     const b = this.binding, ctx = this.context;
-    const token = req.headers.authorization?.replace(/^Bearer /, '');
+    // Dashboard terminal proxies deliberately strip browser Authorization.
+    // This independent capability survives that hop and grants no terminal access.
+    const token = req.headers['x-riff-host-token'] ?? req.headers.authorization?.replace(/^Bearer /, '');
     if (!b || !ctx || !ctx.isCurrent() || typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)
       || token.length !== b.token.length || !timingSafeEqual(Buffer.from(token), Buffer.from(b.token))) { json(403, { error: 'riff_host_turn_unavailable' }); return; }
+    if (req.method === 'GET' && new URL(req.url!, 'http://localhost').searchParams.get('artifact') === 'cli') {
+      if (!b.cliSha256 || !isStandaloneBinary()) { json(404, { error: 'riff_host_cli_artifact_unavailable' }); return; }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'content-length': statSync(process.execPath).size });
+      createReadStream(process.execPath).on('error', () => res.destroy()).pipe(res);
+      return;
+    }
     try {
       let request: RiffHostRequest | undefined;
       let operationId: string;
@@ -223,7 +263,7 @@ export class RiffHostTools {
       const fingerprint = request ? createHash('sha256').update(JSON.stringify(request)).digest('hex') : undefined;
       if (op && (op.turnId !== ctx.turnId || (fingerprint && op.fingerprint !== fingerprint))) { json(409, { error: 'riff_host_operation_conflict' }); return; }
       if (!op && request) {
-        if (this.operations.size >= 16) { json(429, { error: 'riff_host_busy' }); return; }
+        if (this.operations.size >= 16 || this.sweep(ctx) >= RECEIPT_LIMIT) { json(429, { error: 'riff_host_busy' }); return; }
         op = { fingerprint: fingerprint!, turnId: ctx.turnId };
         atomicWriteFileSync(path, JSON.stringify(op), { mode: 0o600, durable: true, followTargetSymlink: false });
         const receipt = op;

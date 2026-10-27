@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,7 @@ import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-car
 import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHostRequest,
   type RiffHostContext, type RiffHostBinding } from '../src/services/riff-host-tools.js';
 import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments } from '../src/cli/riff-host-tools.js';
+import { assertCardPatchChat } from '../src/cli/card-dispatch.js';
 
 const roots: string[] = [], servers: Server[] = [];
 function root(): string { const r = mkdtempSync(join(tmpdir(), 'riff-host-test-')); roots.push(r); return r; }
@@ -35,6 +36,34 @@ afterEach(async () => {
 });
 
 describe('Riff host boundary', () => {
+  it('refuses cards from another chat and fails closed when lookup fails', async () => {
+    await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => 'oc_here')).resolves.toBeUndefined();
+    await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => 'oc_elsewhere')).rejects.toThrow('outside_session');
+    await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => null)).rejects.toThrow('outside_session');
+    await expect(assertCardPatchChat('cli_test', 'om_card', 'oc_here', async () => { throw new Error('lookup failed'); })).rejects.toThrow();
+  });
+
+  it('expires old-turn receipts while retaining current-turn replay protection', async () => {
+    const ctx = context(), directory = join(ctx.dataDir, 'sessions', ctx.sessionId, 'riff-host-operations');
+    mkdirSync(directory, { recursive: true });
+    const old = join(directory, `${'a'.repeat(64)}.json`), current = join(directory, `${'b'.repeat(64)}.json`);
+    writeFileSync(old, JSON.stringify({ turnId: 'previous-turn', fingerprint: 'a'.repeat(64) }));
+    writeFileSync(current, JSON.stringify({ turnId: ctx.turnId, fingerprint: 'b'.repeat(64) }));
+    const ancient = new Date(Date.now() - 30 * 24 * 60 * 60_000);
+    utimesSync(old, ancient, ancient); utimesSync(current, ancient, ancient);
+    const gateway = new RiffHostTools(); gateway.bind(await listen(gateway), ctx);
+    expect(readdirSync(directory)).toEqual([`${'b'.repeat(64)}.json`]);
+  });
+
+  it('accepts send aliases and stream operations without allowing host paths', async () => {
+    expect(parseRiffHostRequest(request(['send', 'body', '--voice', '--no-mention'])).argv).toContain('--voice');
+    const path = join(root(), 'image.png'); writeFileSync(path, 'image');
+    const r = await prepareRiffHostRequest(['send', 'body', '--image', path, '--no-mention'], async () => { throw new Error('unexpected stdin'); });
+    expect(parseRiffHostRequest(r).files).toHaveLength(1);
+    expect(parseRiffHostRequest(request(['card', 'stream', 'open', '--message-id', 'om_card'])).argv[2]).toBe('open');
+    expect(parseRiffHostRequest(request(['whiteboard', 'status'])).argv[1]).toBe('status');
+    expect(() => parseRiffHostRequest(request(['whiteboard', 'read', '--id', 'other']))).toThrow();
+  });
   it('delivers through the real host send path, indexes feedback and accepts a click without resending', async () => {
     const directory = root(), dataDir = join(directory, 'data'), app = 'cli_test', turnId = 'om_turn_host';
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
@@ -116,9 +145,12 @@ describe('Riff host boundary', () => {
     } });
     const observed: Array<{ path: string; body: any }> = [];
     const ipc = createServer(async (req, res) => {
+      if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk);
-      const body = JSON.parse(Buffer.concat(chunks).toString());
+      let body: any;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); }
+      catch { res.writeHead(400); res.end(); return; }
       observed.push({ path: req.url!, body });
       const response = req.url === '/api/asks'
         ? { kind: 'answered', answers: [['yes']], by: 'ou_requester' }

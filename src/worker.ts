@@ -20509,7 +20509,7 @@ async function spawnCli(
       env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId,
       hostToolsBinding: noTransport || isWorkflowWorker() ? undefined : () => {
         const authority = activeTurnAuthority.identity();
-        if (!authority.turnId || !sessionId || noTransport || isWorkflowWorker()) throw new Error('riff_host_turn_unavailable');
+        if (!authority.turnId || !sessionId || noTransport || isWorkflowWorker()) return undefined;
         const turnId = authority.turnId;
         const attempt = authority.dispatchAttempt;
         const observedBackend = backend;
@@ -20527,7 +20527,7 @@ async function spawnCli(
           : `http://${host.includes(':') ? `[${host}]` : host}:${address.port}${RIFF_HOST_TOOLS_ROUTE}`);
         const endpoint = new URL(url);
         if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password
-          || endpoint.search || endpoint.hash || endpoint.pathname !== RIFF_HOST_TOOLS_ROUTE && !endpoint.pathname.endsWith(RIFF_HOST_TOOLS_ROUTE)) throw new Error('riff_host_endpoint_invalid');
+          || endpoint.search || endpoint.hash || (endpoint.pathname !== RIFF_HOST_TOOLS_ROUTE && !endpoint.pathname.endsWith(RIFF_HOST_TOOLS_ROUTE))) throw new Error('riff_host_endpoint_invalid');
         const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_LARK_APP_ID: cfg.larkAppId, BOTMUX_CHAT_ID: cfg.chatId,
           BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage ? 'thread' : 'chat',
           BOTMUX_LINK_REF_TURN_MODE: currentBotmuxLinkRefMode };

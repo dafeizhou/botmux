@@ -49,7 +49,7 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
   let stdin: string | undefined;
   const hasFlag = (flag: string) => args.some(a => a === flag || a.startsWith(`${flag}=`));
   if (args[0] === 'send' && !hasFlag('--content-file') && !hasFlag('--card-file') && !hasFlag('--card-json')) {
-    const valueFlags = new Set(['--response-kind', '--mention', '--layout', '--expected-link', '--quote', '--as', '--voice', '--plugin-card-action', '--images', '--files', '--videos', '--video-covers', '--completion-proposal-file']);
+  const valueFlags = new Set(['--response-kind', '--mention', '--layout', '--expected-link', '--quote', '--as', '--plugin-card-action', '--image-mode', '--text', '--images', '--image', '--files', '--file', '--videos', '--video-covers', '--completion-proposal-file']);
     let positional = false;
     for (let i = 1; i < args.length; i++) {
       if (valueFlags.has(args[i]!)) { i++; continue; }
@@ -63,7 +63,7 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
 }
 
 export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHostRequest, fetchImpl = fetch): Promise<RiffHostResult> {
-  const headers = { authorization: `Bearer ${binding.token}`, 'content-type': 'application/json' };
+  const headers = { 'x-riff-host-token': binding.token, 'content-type': 'application/json' };
   const deadline = Date.now() + 62 * 60_000;
   let posted = false, transportFailures = 0;
   while (Date.now() < deadline) {
