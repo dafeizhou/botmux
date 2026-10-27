@@ -122,11 +122,21 @@ describe('Riff worker session environment', () => {
     'http://host/api/riff-host-tools?token=private-config-secret'])('reports invalid hostToolsUrl before dispatch: %#', async hostToolsUrl => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-preflight-'));
     let outbound = 0;
-    const server = createServer((_req, res) => { outbound++; res.writeHead(500); res.end(); });
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && (req.url === '/api/task-execute' || req.url === '/api/task-follow-up')) outbound++;
+      res.writeHead(404); res.end();
+    });
     let child: ChildProcess | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const port = await listen(server);
+      // Exercise the same background probes as host port scanners. These must
+      // not count as Riff task dispatch, regardless of their arrival timing.
+      for (let i = 0; i < 2; i++) {
+        const probe = await fetch(`http://127.0.0.1:${port}/`);
+        expect(probe.status).toBe(404);
+        await probe.text();
+      }
       const appId = 'cli_riff_preflight', botsPath = join(root, 'bots.json');
       writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'test-secret',
         cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}` } }]));

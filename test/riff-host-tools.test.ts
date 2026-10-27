@@ -43,11 +43,11 @@ describe('Riff host boundary', () => {
     expect(new RiffHostTools().bind('http://host/api/riff-host-tools', ctx).turnId).toBe(ctx.turnId);
   });
 
-  it.each(['mkdir', 'readdir', 'stat', 'read', 'rm', 'race'])('keeps maintenance failures out of task binding and protects execution: %s', async mode => {
+  it('keeps maintenance failures out of task binding and protects execution across the fault matrix', async () => {
     // Node's syncBuiltinESMExports provides real fs fault injection. Bun does
     // not update named built-in exports through this API; use Node explicitly.
     const child = spawnNodeTsScript(fileURLToPath(new URL('./fixtures/riff-host-maintenance.ts', import.meta.url)),
-      [root(), mode], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: ['ignore', 'pipe', 'pipe'] });
+      [root()], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout!.on('data', chunk => { stdout += chunk; });
     child.stderr!.on('data', chunk => { stderr += chunk; });
@@ -56,9 +56,14 @@ describe('Riff host boundary', () => {
     try { code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); }); }
     finally { clearTimeout(timeout); }
     expect(code, stderr).toBe(0);
-    const result = JSON.parse(stdout);
-    expect(result).toEqual(mode === 'race' ? { status: 200, executed: 1, removed: true }
-      : { status: mode === 'mkdir' ? 400 : 429, executed: 0, removed: false });
+    expect(JSON.parse(stdout)).toEqual([
+      { mode: 'mkdir', status: 400, executed: 0, removed: false },
+      { mode: 'readdir', status: 429, executed: 0, removed: false },
+      { mode: 'stat', status: 429, executed: 0, removed: false },
+      { mode: 'read', status: 429, executed: 0, removed: false },
+      { mode: 'rm', status: 429, executed: 0, removed: false },
+      { mode: 'race', status: 200, executed: 1, removed: true },
+    ]);
   });
 
   it.each(['oc_test', 'oc_elsewhere', '__missing__'])('enforces the chat boundary in the real card patch CLI: %s', async chatId => {
