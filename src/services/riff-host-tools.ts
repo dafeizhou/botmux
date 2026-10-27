@@ -210,11 +210,23 @@ export class RiffHostTools {
 
   private sweep(ctx: RiffHostContext): number {
     const directory = join(ctx.dataDir, 'sessions', ctx.sessionId, 'riff-host-operations');
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const entries = readdirSync(directory).filter(n => /^[a-f0-9]{64}\.json$/.test(n))
-      .map(n => { const path = join(directory, n); return { path, mtime: statSync(path).mtimeMs }; })
-      .sort((a, b) => a.mtime - b.mtime);
-    let retained = entries.length;
+    // Maintenance must never prevent task delivery. An unreadable directory is
+    // conservatively full: new operations fail closed until storage recovers.
+    try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { return RECEIPT_LIMIT; }
+    let names: string[];
+    try { names = readdirSync(directory).filter(n => /^[a-f0-9]{64}\.json$/.test(n)); } catch { return RECEIPT_LIMIT; }
+    let retained = names.length;
+    const entries: Array<{ path: string; mtime: number }> = [];
+    for (const name of names) {
+      const path = join(directory, name);
+      try { entries.push({ path, mtime: statSync(path).mtimeMs }); }
+      catch (err) {
+        // The daemon's orphan sweep may remove a directory after readdir.
+        // Other stat failures still count toward the limit and are not deleted.
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') retained--;
+      }
+    }
+    entries.sort((a, b) => a.mtime - b.mtime);
     for (const entry of entries) {
       if (this.operations.has(entry.path)) continue;
       if (Date.now() - entry.mtime <= RECEIPT_TTL_MS && retained < RECEIPT_LIMIT) continue;
@@ -223,7 +235,7 @@ export class RiffHostTools {
       // A current-turn receipt is never evicted: replay must not execute twice.
       if (op.turnId === ctx.turnId) continue;
       if (Date.now() - entry.mtime > RECEIPT_TTL_MS || retained >= RECEIPT_LIMIT) {
-        rmSync(entry.path, { force: true }); retained--;
+        try { rmSync(entry.path, { force: true }); retained--; } catch { /* retry on a later sweep */ }
       }
     }
     return retained;

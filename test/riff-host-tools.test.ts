@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
-import { isBunRuntime } from './helpers/ts-runner.js';
+import { isBunRuntime, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
@@ -36,6 +36,31 @@ afterEach(async () => {
 });
 
 describe('Riff host boundary', () => {
+  it.each(['session-file', 'receipt-file'])('still binds when receipt storage is a stale file: %s', mode => {
+    const ctx = context(), session = join(ctx.dataDir, 'sessions', ctx.sessionId);
+    mkdirSync(mode === 'session-file' ? join(ctx.dataDir, 'sessions') : session, { recursive: true });
+    writeFileSync(mode === 'session-file' ? session : join(session, 'riff-host-operations'), 'stale');
+    expect(new RiffHostTools().bind('http://host/api/riff-host-tools', ctx).turnId).toBe(ctx.turnId);
+  });
+
+  it.each(['mkdir', 'readdir', 'stat', 'read', 'rm', 'race'])('keeps maintenance failures out of task binding and protects execution: %s', async mode => {
+    // Node's syncBuiltinESMExports provides real fs fault injection. Bun does
+    // not update named built-in exports through this API; use Node explicitly.
+    const child = spawnNodeTsScript(fileURLToPath(new URL('./fixtures/riff-host-maintenance.ts', import.meta.url)),
+      [root(), mode], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout!.on('data', chunk => { stdout += chunk; });
+    child.stderr!.on('data', chunk => { stderr += chunk; });
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 20_000);
+    let code: number | null;
+    try { code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); }); }
+    finally { clearTimeout(timeout); }
+    expect(code, stderr).toBe(0);
+    const result = JSON.parse(stdout);
+    expect(result).toEqual(mode === 'race' ? { status: 200, executed: 1, removed: true }
+      : { status: mode === 'mkdir' ? 400 : 429, executed: 0, removed: false });
+  });
+
   it.each(['oc_test', 'oc_elsewhere', '__missing__'])('enforces the chat boundary in the real card patch CLI: %s', async chatId => {
     const directory = root(), app = 'cli_test';
     mkdirSync(join(directory, '.botmux-cli-pids'), { recursive: true });

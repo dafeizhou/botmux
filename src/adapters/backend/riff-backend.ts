@@ -13,6 +13,8 @@ import type {
 import { logger } from '../../utils/logger.js';
 import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 import { detectImageFormat } from '../../core/attachment-image-format.js';
+import { shellQuote } from '../../core/cli-launch-mode.js';
+import type { RiffHostBinding } from '../../services/riff-host-tools.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -220,6 +222,17 @@ export function isValidRiffBaseUrl(v: unknown): v is string {
   } catch {
     return false;
   }
+}
+
+/** Public host-tool endpoint, optionally containing a {sessionId} path template. */
+export function isValidRiffHostToolsUrl(v: unknown): v is string {
+  if (typeof v !== 'string' || !v || /[\s\x00-\x1f\x7f'"\\?#]/.test(v)) return false;
+  try {
+    const u = new URL(v);
+    return (u.protocol === 'http:' || u.protocol === 'https:')
+      && !u.username && !u.password && !u.search && !u.hash
+      && u.pathname.endsWith('/api/riff-host-tools');
+  } catch { return false; }
 }
 
 export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
@@ -2038,13 +2051,24 @@ export class RiffBackend implements SessionBackend {
     const sys = custom
       ? `${DEFAULT_RIFF_SYSTEM_PROMPT}\n\n<additional_instructions>\n${custom}\n</additional_instructions>`
       : DEFAULT_RIFF_SYSTEM_PROMPT;
-    const binding = this.config.hostToolsBinding?.();
+    let binding: RiffHostBinding | undefined;
+    let unavailable = false;
+    try { binding = this.config.hostToolsBinding?.(); }
+    catch {
+      // Binding is optional infrastructure. Never drop a user message because
+      // URL resolution, PID publication, CLI hashing or storage failed. Avoid
+      // logging the thrown value: it can contain credentials or a private URL.
+      logger.warn('[riff] host-tools binding unavailable; continuing task without host tools');
+      unavailable = true;
+    }
     const install = binding?.cliSha256
-      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != '${binding.cliSha256}' ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H 'x-riff-host-token: ${binding.token}' '${binding.url}?artifact=cli' -o "$artifact"; printf '%s  %s\\n' '${binding.cliSha256}' "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
+      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != ${shellQuote(binding.cliSha256)} ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact"; printf '%s  %s\\n' ${shellQuote(binding.cliSha256)} "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
       : '';
     const host = binding
       ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${install}BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}\nFor EVERY following botmux helper, also use the explicit prefix BOTMUX_RIFF_HOST_TOOLS=1 (including in existing tasks whose creation-time environment cannot change).\nAll stateful botmux helpers execute on the owning host. Card stream open/write/snapshot/reanchor/finish are supported. Whiteboard supports status only; skip other whiteboard operations even if a generic skill describes them.\nNever print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
-      : '';
+      : unavailable
+        ? '\n\n<botmux_host_tools_unavailable>Host tools are unavailable for this turn. Continue processing the request, but report the delivery/tool failure in the task output. Do not use a previous binding, call Lark directly, seek other credentials, or start a sandbox daemon. This overrides the direct-API fallback above.</botmux_host_tools_unavailable>'
+        : '';
     return `<system>\n${sys}${host}\n</system>\n\n${prompt}`;
   }
 
