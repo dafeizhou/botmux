@@ -11,10 +11,13 @@ describe('signed Codex App engine identity', () => {
     expect(verifyCodexAppEngineIdentity({ pid: 124, procStart: '456' }, liveStart)).toBeUndefined();
   });
 
-  it.each([null, [], {}, { pid: 1, procStart: '456' }, { pid: 1.5, procStart: '456' },
-    { pid: '123', procStart: '456' }, { pid: 123, procStart: 456 },
-    { pid: 123, procStart: '456\n' }, { pid: 123, procStart: '456', extra: true }])(
-    'rejects malformed process proof %j', value => {
+  it.each([
+    { value: null }, { value: [] }, { value: {} },
+    { value: { pid: 1, procStart: '456' } }, { value: { pid: 1.5, procStart: '456' } },
+    { value: { pid: '123', procStart: '456' } }, { value: { pid: 123, procStart: 456 } },
+    { value: { pid: 123, procStart: '456\n' } }, { value: { pid: 123, procStart: '456', extra: true } },
+  ])(
+    'rejects malformed process proof %j', ({ value }) => {
       expect(verifyCodexAppEngineIdentity(value, liveStart)).toBeUndefined();
     },
   );
