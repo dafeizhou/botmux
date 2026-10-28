@@ -4,6 +4,7 @@ import {
   chmodSync,
   copyFileSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +15,7 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 
 // The worker inherits process.env, so its panes live on this server.
 const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
@@ -210,6 +212,7 @@ describe('Codex App worker queued-turn attribution', () => {
         LARK_APP_ID: 'app_worker_routing',
         LARK_APP_SECRET: 'secret',
         FAKE_CODEX_LOG: requestLog,
+        FAKE_CODEX_PID_PATH: join(root, 'app-server.pid'),
         FAKE_CODEX_VERSION: '0.136.0',
         // Hold turn 1 open so flushPending deterministically writes turn 2 and
         // overwrites its legacy singleton globals before final 1 arrives.
@@ -274,6 +277,15 @@ describe('Codex App worker queued-turn attribution', () => {
       const finals = messages.filter(
         (message): message is Extract<WorkerToDaemon, { type: 'final_output' }> => message.type === 'final_output',
       );
+      if (process.platform === 'linux') {
+        const enginePid = Number(readFileSync(join(root, 'app-server.pid'), 'utf8').trim());
+        const attestation = messages.findLast(message => message.type === 'local_process_attestation');
+        expect(attestation).toMatchObject({
+          enginePid,
+          engineProcStart: readProcessStartIdentity(enginePid),
+        });
+        expect(enginePid).toBeGreaterThan(1);
+      }
       expect(finals.map(final => ({
         turnId: final.turnId,
         content: final.content,

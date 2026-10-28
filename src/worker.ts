@@ -79,6 +79,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import { verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
@@ -5723,6 +5724,13 @@ let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
+
+function clearCodexAppEngineIdentity(): void {
+  if (!codexAppEngineIdentity) return;
+  codexAppEngineIdentity = undefined;
+  publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+}
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -5817,6 +5825,7 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  clearCodexAppEngineIdentity();
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
   // after the old runner proves a warm reattach; stale queued entries must not
@@ -5951,6 +5960,7 @@ function activateCodexAppControlConnection(
     return;
   }
   codexAppControlStateValue = active;
+  clearCodexAppEngineIdentity();
   codexAppControlProven = true;
   codexAppSignedStateObserved = false;
   codexAppInputReady = false;
@@ -6218,6 +6228,7 @@ function acceptCodexAppControlSocket(
     const wasActive = codexAppControlActiveSocket === socket;
     if (wasActive) {
       codexAppControlActiveSocket = undefined;
+      clearCodexAppEngineIdentity();
       codexAppControlProven = false;
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
@@ -15205,6 +15216,22 @@ async function handleTrustedCodexAppMarker(
       failCodexAppControlGeneration(
         'Codex App runner published signed state without boolean acceptingInput',
       );
+      return false;
+    }
+    if (process.platform === 'linux' && payload.appServerProcess !== undefined) {
+      const engine = verifyCodexAppEngineIdentity(payload.appServerProcess);
+      if (!engine || (codexAppEngineIdentity
+        && (codexAppEngineIdentity.pid !== engine.pid
+          || codexAppEngineIdentity.procStart !== engine.procStart))) {
+        failCodexAppControlGeneration('Codex App runner published an invalid or changed app-server process');
+        return false;
+      }
+      if (!codexAppEngineIdentity) {
+        codexAppEngineIdentity = engine;
+        publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+      }
+    } else if (process.platform === 'linux' && codexAppEngineIdentity) {
+      failCodexAppControlGeneration('Codex App runner dropped its attested app-server process');
       return false;
     }
     if (readiness === 'waiting') {
@@ -28695,7 +28722,10 @@ function publishLocalProcessAttestation(
   enginePid = codexRpcEngine?.appServerPid,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Keep the signed birth token frozen. Re-reading it for a cached PID would
+  // silently authorize a replacement process after PID reuse.
+  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : codexAppEngineIdentity?.procStart;
+  enginePid ??= codexAppEngineIdentity?.pid;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
