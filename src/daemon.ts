@@ -8040,7 +8040,12 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     || targetAppIds.some((id: unknown) => typeof id !== 'string' || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(id))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_handoff' });
   }
-  const skip = (reason: string) => jsonRes(res, 200, { ok: true, delegated: false, reason });
+  const skip = (reason: string) => {
+    // The send itself goes ahead either way; without this line a handoff that
+    // carried no sender is indistinguishable from one that was never tried.
+    logger.info(`[dispatch-user:audit] mention-prepare skipped source=${ds.larkAppId} chat=${chatId} reason=${reason}`);
+    return jsonRes(res, 200, { ok: true, delegated: false, reason });
+  };
   const bot = getBot(ds.larkAppId).config;
   if (!delegatesOnMention(bot.triggerUserAuth)) return skip('delegate_on_mention_off');
   // A handoff carries the sender only inside the chat this turn came from.
@@ -8053,17 +8058,25 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
   if (!turnId) return skip('no_live_turn');
   try {
     const active = ds.activeInteractiveTurn;
-    // Only a person who sent THIS turn directly. A turn that is itself a
-    // delegation, a schedule or a bot-to-bot message has no sender to hand on.
+    // The person who sent THIS turn directly, or — exactly as `botmux dispatch`
+    // does — the sender a verified delegation already gave this turn, so a
+    // lead that is handed a report by one bot can still hand the same person
+    // on to the next. Re-checked against this chat and narrowed to this bot's
+    // tools; a schedule or a plain bot-to-bot message still has no sender.
+    const inherited = await dispatchUserForTurn(ds, turnId);
+    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+      return skip('delegated_caller_not_allowed');
+    }
     const authority = await authorityForDispatch({
       sourceAppId: ds.larkAppId,
       caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      inherited: inherited?.authority,
       tools: bot.triggerUserAuth!.tools,
       resolveUnionId: resolveUnionIdFromOpenId,
     });
-    if (!authority) return skip('no_direct_human');
+    if (!authority) return skip(inherited ? 'no_shared_tool' : 'no_direct_human');
     if (ds.managedTurnOrigin?.turnId !== turnId) {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }
@@ -11613,25 +11626,29 @@ async function synchronizeVcMeetingInviters(session: VcMeetingDaemonSession, cfg
   const pending = (session.inviterManagers ?? []).filter(g => !g.memberReady
     && g.policyEnabledAt === (currentPolicy().inviterManagementEnabledAt ?? 0));
   if (!pending.length) return;
+  const canSynchronize = (grant: VcMeetingInviterGrant): boolean => {
+    const policy = currentPolicy();
+    return !session.ended && session.listenerChatId === chatId && policy.inviterManagementEnabled === true
+      && grant.policyEnabledAt === (policy.inviterManagementEnabledAt ?? 0)
+      && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId);
+  };
   const work = (async () => {
     for (const grant of pending) {
       try {
-        if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
-          || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+        if (!canSynchronize(grant)) continue;
         let members = await listChatMemberDisplays(session.larkAppId, chatId);
+        // A block/off-toggle/rebind can happen while the group or member read is
+        // in flight. Recheck before expanding visibility, not just at invitation.
+        if (!canSynchronize(grant)) continue;
         if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) {
           // Never expand an owner-selected/shared/preparation group's visibility.
           if (!session.listenerChatCreatedForMeeting) throw new Error('shared listener chat requires an existing membership');
-          if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
-            || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
           const added = await addUsersToChatByOpenId(session.larkAppId, chatId, [grant.openId]);
           if (added.invalidUserIds.length) throw new Error('inviter could not be added to listener chat');
           members = await listChatMemberDisplays(session.larkAppId, chatId);
           if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) throw new Error('listener membership not verified');
         }
-        // A rejoin may redirect the session to a preparation chat during an API call.
-        if (session.listenerChatId !== chatId || session.ended) break;
-        // Saving after an off-toggle is harmless: every use checks the live policy/epoch.
+        if (!canSynchronize(grant)) continue;
         grant.memberReady = true;
         persistVcMeetingRuntimeSession(session, cfg);
       } catch (err) {
@@ -19510,6 +19527,12 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     if (!session) return;
     let inviterGrantUnavailable = cfg.inviterManagementEnabled === true;
     let inviterBlocked = false;
+    if (cfg.inviterManagementEnabled === true) {
+      const diagnostic = ctx.invitationDiagnostics;
+      logger.info(`[vc-agent] invitation identity meeting=${meeting.id} eventId=${ctx.eventId ?? '?'}`
+        + ` status=${diagnostic?.inviterStatus ?? (ctx.inviter ? 'resolved' : 'unavailable')}`
+        + ` idShape=${diagnostic?.inviterIdShape ?? 'unknown'} inviteTime=${diagnostic?.inviteTimeStatus ?? 'unknown'}`);
+    }
     if (ctx.inviter) {
       const grant = createVcMeetingInviterGrant(cfg, { ...ctx.inviter, eventId: ctx.eventId });
       if (grant && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) {
