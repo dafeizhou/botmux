@@ -15219,7 +15219,10 @@ async function handleTrustedCodexAppMarker(
       return false;
     }
     if (process.platform === 'linux' && payload.appServerProcess !== undefined) {
-      const engine = verifyCodexAppEngineIdentity(payload.appServerProcess);
+      const engine = verifyCodexAppEngineIdentity(
+        payload.appServerProcess,
+        backend?.getChildPid?.() ?? undefined,
+      );
       if (!engine || (codexAppEngineIdentity
         && (codexAppEngineIdentity.pid !== engine.pid
           || codexAppEngineIdentity.procStart !== engine.procStart))) {
