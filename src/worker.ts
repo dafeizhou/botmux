@@ -15358,19 +15358,27 @@ async function handleTrustedCodexAppMarker(
         payload.appServerProcess,
         backend?.getChildPid?.() ?? undefined,
       );
-      if (!engine || (codexAppEngineIdentity
-        && (codexAppEngineIdentity.pid !== engine.pid
-          || codexAppEngineIdentity.procStart !== engine.procStart))) {
+      const previousEngine = codexAppEngineIdentity;
+      const changed = engine && previousEngine
+        && (previousEngine.pid !== engine.pid || previousEngine.procStart !== engine.procStart);
+      // The runner reconnects an idle app-server on the same control socket.
+      // A replacement is legitimate only after the attested old process died;
+      // keep the frozen birth token so PID reuse never counts as still alive.
+      if (!engine || (changed && previousEngine
+        && readProcessStartIdentity(previousEngine.pid) === previousEngine.procStart)) {
         failCodexAppControlGeneration('Codex App runner published an invalid or changed app-server process');
         return false;
       }
-      if (!codexAppEngineIdentity) {
+      if (!codexAppEngineIdentity || changed) {
         codexAppEngineIdentity = engine;
         publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
       }
     } else if (process.platform === 'linux' && codexAppEngineIdentity) {
-      failCodexAppControlGeneration('Codex App runner dropped its attested app-server process');
-      return false;
+      if (readProcessStartIdentity(codexAppEngineIdentity.pid) === codexAppEngineIdentity.procStart) {
+        failCodexAppControlGeneration('Codex App runner dropped its attested app-server process');
+        return false;
+      }
+      clearCodexAppEngineIdentity();
     }
     if (readiness === 'waiting') {
       if (typeof payload.busy !== 'boolean') {
@@ -21115,6 +21123,7 @@ async function spawnCli(
   }
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
+    cliId: cfg.cliId,
     fileSandboxRequested: sandboxRequested,
     ...(effectiveBackendType === 'mojo'
       ? { mojoConfig: (riffBackendConfig ?? {}) as EffectiveMojoConfig }
