@@ -80,7 +80,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
-import { verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
+import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
@@ -5732,6 +5732,41 @@ function clearCodexAppEngineIdentity(): void {
   codexAppEngineIdentity = undefined;
   publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
 }
+
+/** A persistent backend may authenticate its runner before it resolves the
+ * pane's host PID. Keep this signed state pending, without ACK/readiness, under
+ * the existing absolute proof deadline. A retired connection cannot publish. */
+async function waitForCodexAppEngineRoot(
+  ownerSocket = codexAppControlActiveSocket,
+  ownerChannel = codexAppControlChannelId,
+  ownerEpoch = codexAppControlEndpointEpoch,
+): Promise<{ pid: number; assertCurrent: () => void }> {
+  let ownerBackend = backend;
+  const current = () => !!(ownerSocket && !ownerSocket.destroyed && !codexAppControlFatal
+    && codexAppControlProven && (!ownerBackend || backend === ownerBackend)
+    && codexAppControlActiveSocket === ownerSocket && codexAppControlChannelId === ownerChannel
+    && codexAppControlEndpointEpoch === ownerEpoch);
+  const cancelled = () => new CodexAppEngineRootWaitCancelled(ownerSocket, ownerBackend, ownerChannel);
+  const assertCurrent = () => { if (!current()) throw cancelled(); };
+  assertCurrent();
+  codexAppSignedStateObserved = false;
+  codexAppInputReady = false;
+  codexAppReadyAuthority.beginWork();
+  isPromptReady = false;
+  idleDetector?.reset();
+  if (!codexAppProofDeadline.armed) {
+    codexAppProofDeadline.arm(() => {
+      failCodexAppControlGeneration('Codex App backend did not resolve its process before the proof deadline');
+    });
+  }
+  while (current()) {
+    ownerBackend ??= backend;
+    const pid = ownerBackend?.getChildPid?.();
+    if (pid !== null && pid !== undefined) return { pid, assertCurrent };
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  throw cancelled();
+}
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -6091,31 +6126,44 @@ async function handleCodexAppControlLine(
   // worker effects is single-flight by signed generation/sequence until the
   // replay window below is committed.
   if (finalResult.status === 'accepted') return;
-  const application = codexAppControlRecordApplicationGate.run(
-    identity.generation,
-    record.seq,
-    () => finalResult.status === 'not-final'
+  const applyRecord = () => finalResult.status === 'not-final'
       ? handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
-          { generation: identity.generation, seq: record.seq },
+          { generation: identity.generation, seq: record.seq, socket: connection.socket,
+            channelId: connection.channelId, epoch: connection.epoch },
         )
       : handleTrustedCodexAppMarker(
           'final',
           finalResult.payload,
-          { generation: identity.generation, seq: record.seq },
-        ),
-  );
+          { generation: identity.generation, seq: record.seq, socket: connection.socket,
+            channelId: connection.channelId, epoch: connection.epoch },
+        );
+  let application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
   let applied: boolean;
-  try {
-    applied = await application;
-  } catch (err) {
-    codexAppControlRecordApplicationGate.release(
-      identity.generation,
-      record.seq,
-      application,
-    );
-    throw err;
+  for (;;) {
+    try {
+      applied = await application;
+      break;
+    } catch (err) {
+      codexAppControlRecordApplicationGate.release(identity.generation, record.seq, application);
+      // A fresh authenticated connection may share the old connection's
+      // in-flight sequence. Retry its cancelled local PID wait here; a genuine
+      // semantic failure must still reject the marker without an ACK.
+      if (err instanceof CodexAppEngineRootWaitCancelled && !codexAppControlFatal
+        && err.ownerSocket !== connection.socket
+        // An unbound wait may follow the backend's FIRST installation, while
+        // an already-owned backend cannot be replaced under its old frame.
+        && (err.ownerBackend === null || err.ownerBackend === backend)
+        && err.ownerChannel === codexAppControlChannelId
+        && codexAppControlProven && connection.socket === codexAppControlActiveSocket
+        && !connection.socket.destroyed && connection.channelId === codexAppControlChannelId
+        && connection.epoch === codexAppControlEndpointEpoch) {
+        application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
+        continue;
+      }
+      throw err;
+    }
   }
   if (!applied) {
     codexAppControlRecordApplicationGate.release(
@@ -15256,7 +15304,7 @@ async function retireCodexAppDispatchForDurableReplay(
 async function handleTrustedCodexAppMarker(
   kind: string,
   payload: Record<string, unknown>,
-  control?: { generation: string; seq: number },
+  control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
   if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (typeof payload.requestId !== 'string'
@@ -15354,9 +15402,20 @@ async function handleTrustedCodexAppMarker(
       return false;
     }
     if (process.platform === 'linux' && payload.appServerProcess !== undefined) {
+      const claim = parseCodexAppEngineIdentityClaim(payload.appServerProcess);
+      if (!claim) {
+        failCodexAppControlGeneration('Codex App runner published an invalid app-server process claim');
+        return false;
+      }
+      let rootPid = backend?.getChildPid?.();
+      if (rootPid === null || rootPid === undefined) {
+        const resolved = await waitForCodexAppEngineRoot(control?.socket, control?.channelId, control?.epoch);
+        resolved.assertCurrent();
+        rootPid = resolved.pid;
+      }
       const engine = verifyCodexAppEngineIdentity(
-        payload.appServerProcess,
-        backend?.getChildPid?.() ?? undefined,
+        claim,
+        rootPid,
       );
       const previousEngine = codexAppEngineIdentity;
       const changed = engine && previousEngine

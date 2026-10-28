@@ -7,6 +7,29 @@ export interface CodexAppEngineIdentity {
   procStart: string;
 }
 
+/** A local wait retired; it is not a semantic rejection of a replayed frame. */
+export class CodexAppEngineRootWaitCancelled extends Error {
+  constructor(
+    readonly ownerSocket: object | undefined,
+    readonly ownerBackend: object | null,
+    readonly ownerChannel: number,
+  ) {
+    super('Codex App engine root wait was retired');
+    this.name = 'CodexAppEngineRootWaitCancelled';
+  }
+}
+
+/** Syntax only: a signed namespace-local claim is not yet a host identity. */
+export function parseCodexAppEngineIdentityClaim(value: unknown): CodexAppEngineIdentity | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some(key => key !== 'pid' && key !== 'procStart')
+    || !Number.isSafeInteger(record.pid) || (record.pid as number) <= 1
+    || typeof record.procStart !== 'string' || !/^\d+$/.test(record.procStart)
+    || record.procStart.length > 64) return undefined;
+  return { pid: record.pid as number, procStart: record.procStart };
+}
+
 /** Only call on an authenticated, signed runner payload. Resolve the runner's
  * namespace-local child PID inside the backend's HOST process tree. Never
  * interpret it as an ambient host PID: bwrap uses --unshare-pid, and an
@@ -17,12 +40,8 @@ export function verifyCodexAppEngineIdentity(
   procRoot = '/proc',
   readProcFile: (path: string) => string = path => readFileSync(path, 'utf8'),
 ): CodexAppEngineIdentity | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  if (Object.keys(record).some(key => key !== 'pid' && key !== 'procStart')
-    || !Number.isSafeInteger(record.pid) || (record.pid as number) <= 1
-    || typeof record.procStart !== 'string' || !/^\d+$/.test(record.procStart)
-    || record.procStart.length > 64) return undefined;
+  const record = parseCodexAppEngineIdentityClaim(value);
+  if (!record) return undefined;
   if (typeof rootPid !== 'number' || !Number.isSafeInteger(rootPid) || rootPid <= 1) return undefined;
   const readStart = (pid: number): string | undefined => {
     try {
